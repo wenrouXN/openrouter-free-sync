@@ -1,0 +1,11 @@
+# Go
+*.so
+*.dylib
+*.dll
+*.h
+/dist/
+/.env
+
+# OS
+.DS_Store
+Thumbs.db
