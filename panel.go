@@ -58,6 +58,16 @@ tr.dead td{opacity:0.45}
 <p class="sub">Auto-sync free OpenRouter models into CPA openai-compatibility provider · v0.2.0</p>
 
 <div class="card">
+  <h2>Management Key</h2>
+  <div class="row">
+    <label>CPA Management Key</label>
+    <input type="password" id="mgmtKeyInput" placeholder="paste CPA management key (saved to localStorage)">
+    <button class="btn" onclick="saveKey()">Save</button>
+    <span id="keyStatus"></span>
+  </div>
+</div>
+
+<div class="card">
   <h2>Sync Status</h2>
   <div id="stats" class="sync-info">Loading…</div>
   <button class="btn" id="refreshBtn" onclick="doRefresh()">🔄 Sync Now</button>
@@ -112,7 +122,20 @@ tr.dead td{opacity:0.45}
 const PLUGIN = "openrouter-free-sync";
 const BASE = "/v0/management/plugins/" + PLUGIN;
 let mgmtKey = "";
-try { mgmtKey = localStorage.getItem("mgmtKey") || localStorage.getItem("management_key") || ""; } catch(e) {}
+try { mgmtKey = localStorage.getItem("mgmtKey") || localStorage.getItem("management_key") || localStorage.getItem("managementKey") || ""; } catch(e) {}
+
+function loadKeyUI() {
+  let inp = document.getElementById("mgmtKeyInput");
+  let st = document.getElementById("keyStatus");
+  if (document.activeElement !== inp) inp.value = mgmtKey;
+  st.innerHTML = mgmtKey ? '<span class="badge ok">key set</span>' : '<span class="badge fail">no key — API calls will 401</span>';
+}
+function saveKey() {
+  mgmtKey = document.getElementById("mgmtKeyInput").value.trim();
+  try { localStorage.setItem("mgmtKey", mgmtKey); } catch(e) {}
+  loadKeyUI();
+  loadStatus(); loadModels(); loadAudit(); loadConfig();
+}
 
 function headers() {
   let h = {"Content-Type":"application/json"};
@@ -123,6 +146,7 @@ async function api(method, path, body) {
   let opts = {method, headers: headers()};
   if (body) opts.body = JSON.stringify(body);
   let r = await fetch(BASE + path, opts);
+  if (r.status === 401) throw new Error("401 unauthorized — paste the CPA management key above and Save");
   if (!r.ok) throw new Error(r.status + " " + (await r.text()).slice(0,200));
   return r.json();
 }
@@ -259,7 +283,7 @@ async function doRefresh() {
   loadStatus(); loadModels(); loadAudit();
 }
 
-loadStatus(); loadModels(); loadAudit(); loadConfig();
+loadKeyUI(); loadStatus(); loadModels(); loadAudit(); loadConfig();
 </script>
 </body>
 </html>`

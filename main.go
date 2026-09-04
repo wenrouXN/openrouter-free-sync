@@ -68,7 +68,7 @@ import (
 
 const abiVersion uint32 = 1
 const pluginID = "openrouter-free-sync"
-const pluginVersion = "0.2.0"
+const pluginVersion = "0.2.1"
 
 // --- JSON envelope ---
 

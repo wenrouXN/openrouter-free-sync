@@ -1,5 +1,5 @@
 PLUGIN_ID = openrouter-free-sync
-VERSION = 0.2.0
+VERSION = 0.2.1
 GOFLAGS = -trimpath -buildvcs=false
 
 .PHONY: build clean test
