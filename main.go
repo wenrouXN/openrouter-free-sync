@@ -59,6 +59,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 	"unsafe"
@@ -66,7 +68,7 @@ import (
 
 const abiVersion uint32 = 1
 const pluginID = "openrouter-free-sync"
-const pluginVersion = "0.1.0"
+const pluginVersion = "0.2.0"
 
 // --- JSON envelope ---
 
@@ -135,9 +137,10 @@ type httpDoResponse struct {
 // --- Global state ---
 
 var (
-	stateMu   sync.Mutex
+	cfgMu     sync.Mutex
 	cfg       PluginConfig
 	ticker    *time.Ticker
+	debounceTimer *time.Timer
 	tickerDone chan struct{}
 	cfgLoaded bool
 )
@@ -226,10 +229,10 @@ func handlePluginRegister(method string, requestBytes []byte) ([]byte, error) {
 		newCfg = defaultConfig()
 	}
 
-	stateMu.Lock()
+	cfgMu.Lock()
 	cfg = newCfg
 	cfgLoaded = true
-	stateMu.Unlock()
+	cfgMu.Unlock()
 
 	// Restart ticker with new config
 	stopTicker()
@@ -257,6 +260,8 @@ func handleManagementRegister() ([]byte, error) {
 		Routes: []managementRoute{
 			{Method: "POST", Path: "/plugins/" + pluginID + "/refresh"},
 			{Method: "GET", Path: "/plugins/" + pluginID + "/status"},
+			{Method: "GET", Path: "/plugins/" + pluginID + "/models"},
+			{Method: "GET", Path: "/plugins/" + pluginID + "/audit"},
 			{Method: "GET", Path: "/plugins/" + pluginID + "/config"},
 			{Method: "PUT", Path: "/plugins/" + pluginID + "/config"},
 		},
@@ -281,6 +286,10 @@ func handleManagementHandle(requestBytes []byte) ([]byte, error) {
 		return okEnvelope(handleRefresh())
 	case req.Method == "GET" && req.Path == "/v0/management/plugins/"+pluginID+"/status":
 		return okEnvelope(handleStatus())
+	case req.Method == "GET" && req.Path == "/v0/management/plugins/"+pluginID+"/models":
+		return okEnvelope(handleModels())
+	case req.Method == "GET" && req.Path == "/v0/management/plugins/"+pluginID+"/audit":
+		return okEnvelope(handleAudit(req))
 	case req.Method == "GET" && req.Path == "/v0/management/plugins/"+pluginID+"/config":
 		return okEnvelope(handleGetConfig())
 	case req.Method == "PUT" && req.Path == "/v0/management/plugins/"+pluginID+"/config":
@@ -293,11 +302,11 @@ func handleManagementHandle(requestBytes []byte) ([]byte, error) {
 // --- Management handlers ---
 
 func handleRefresh() managementResponse {
-	stateMu.Lock()
+	cfgMu.Lock()
 	currentCfg := cfg
-	stateMu.Unlock()
+	cfgMu.Unlock()
 
-	result := runSync(currentCfg)
+	result := runSyncSerialized(currentCfg)
 	setLastSync(result)
 
 	return mgmtFromSync(result)
@@ -305,13 +314,70 @@ func handleRefresh() managementResponse {
 
 func handleStatus() managementResponse {
 	s := getLastSync()
-	return mgmtJSON(s)
+	stateMu.Lock()
+	var active, quarantined, total int
+	var lastMeta LastSyncMeta
+	var auditCount int
+	if st != nil {
+		for _, rec := range st.Models {
+			total++
+			if rec.QuarantineReason != "" {
+				quarantined++
+			} else if rec.Active {
+				active++
+			}
+		}
+		lastMeta = st.LastSync
+		auditCount = len(st.AuditLog)
+	}
+	stateMu.Unlock()
+	return mgmtJSON(map[string]interface{}{
+		"last_sync":       s,
+		"last_sync_meta":  lastMeta,
+		"models_active":   active,
+		"models_quarantined": quarantined,
+		"models_total":    total,
+		"audit_count":     auditCount,
+	})
+}
+
+// handleModels returns detailed metadata + availability for every tracked model.
+func handleModels() managementResponse {
+	stateEnsure(cfg.StatePath)
+	stateMu.Lock()
+	models := make([]*ModelRecord, 0, len(st.Models))
+	for _, rec := range st.Models {
+		models = append(models, rec)
+	}
+	stateMu.Unlock()
+	sort.Slice(models, func(i, j int) bool { return models[i].ContextLength > models[j].ContextLength })
+	return mgmtJSON(map[string]interface{}{"models": models})
+}
+
+// handleAudit returns the audit log (optionally limited via ?limit=N).
+func handleAudit(req managementRequest) managementResponse {
+	limit := 0
+	if v, ok := req.Query["limit"]; ok && len(v) > 0 {
+		if n, err := strconv.Atoi(v[0]); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	stateMu.Lock()
+	var log []AuditEvent
+	if st != nil {
+		log = st.AuditLog
+		if limit > 0 && len(log) > limit {
+			log = log[len(log)-limit:]
+		}
+	}
+	stateMu.Unlock()
+	return mgmtJSON(map[string]interface{}{"count": len(log), "log": log})
 }
 
 func handleGetConfig() managementResponse {
-	stateMu.Lock()
+	cfgMu.Lock()
 	c := cfg
-	stateMu.Unlock()
+	cfgMu.Unlock()
 
 	// Convert excluded_providers list to comma string for display
 	out := map[string]interface{}{
@@ -326,6 +392,11 @@ func handleGetConfig() managementResponse {
 		"provider_name":         c.ProviderName,
 		"management_key":        c.ManagementKey,
 		"cpa_base_url":          c.CPABaseURL,
+		"availability_check":    c.AvailabilityCheck,
+		"availability_fail_threshold": c.AvailabilityFailThreshold,
+		"probe_interval_ms":     c.ProbeIntervalMS,
+		"audit_max_entries":     c.AuditMaxEntries,
+		"state_path":            c.StatePath,
 	}
 	return mgmtJSON(out)
 }
@@ -341,7 +412,7 @@ func handlePutConfig(req managementRequest) managementResponse {
 		return errorResponse(400, "invalid json: "+err.Error())
 	}
 
-	stateMu.Lock()
+	cfgMu.Lock()
 	newCfg := cfg // start from current
 
 	if v, ok := incoming["refresh_interval"].(string); ok {
@@ -379,8 +450,30 @@ func handlePutConfig(req managementRequest) managementResponse {
 	if v, ok := incoming["cpa_base_url"].(string); ok {
 		newCfg.CPABaseURL = v
 	}
+	if v, ok := incoming["availability_check"].(bool); ok {
+		newCfg.AvailabilityCheck = v
+	}
+	if v, ok := incoming["availability_fail_threshold"].(float64); ok {
+		newCfg.AvailabilityFailThreshold = int(v)
+	}
+	if v, ok := incoming["probe_interval_ms"].(float64); ok {
+		newCfg.ProbeIntervalMS = int(v)
+	}
+	if v, ok := incoming["audit_max_entries"].(float64); ok {
+		newCfg.AuditMaxEntries = int(v)
+	}
+	if v, ok := incoming["state_path"].(string); ok {
+		newCfg.StatePath = v
+	}
 
 	cfg = newCfg
+	cfgMu.Unlock()
+
+	// Reload state if the path changed + audit the change
+	stateEnsure(newCfg.StatePath)
+	stateMu.Lock()
+	auditAddLocked("config_updated", "", summarizeConfigChange(incoming))
+	stateSaveLocked()
 	stateMu.Unlock()
 
 	// Restart ticker
@@ -401,19 +494,25 @@ func startTicker(c PluginConfig) {
 
 	go func() {
 		hostLog("info", fmt.Sprintf("openrouter-free-sync: ticker started, interval=%s", formatDuration(d)))
-		// Run once immediately on start
-		result := runSync(c)
-		setLastSync(result)
+
+		// Debounced initial sync: register/reconfigure bursts collapse into one run.
+		debounceTimer = time.AfterFunc(3*time.Second, func() {
+			cfgMu.Lock()
+			currentCfg := cfg
+			cfgMu.Unlock()
+			result := runSyncSerialized(currentCfg)
+			setLastSync(result)
+		})
 
 		for {
 			select {
 			case <-tickerDone:
 				return
 			case <-ticker.C:
-				stateMu.Lock()
+				cfgMu.Lock()
 				currentCfg := cfg
-				stateMu.Unlock()
-				result := runSync(currentCfg)
+				cfgMu.Unlock()
+				result := runSyncSerialized(currentCfg)
 				setLastSync(result)
 			}
 		}
@@ -421,6 +520,10 @@ func startTicker(c PluginConfig) {
 }
 
 func stopTicker() {
+	if debounceTimer != nil {
+		debounceTimer.Stop()
+		debounceTimer = nil
+	}
 	if ticker != nil {
 		ticker.Stop()
 	}
@@ -562,6 +665,23 @@ func mgmtFromSync(r SyncResult) managementResponse {
 }
 
 // --- String helpers (in panel.go's domain but here for package cohesion) ---
+
+// summarizeConfigChange builds a compact audit summary of which fields changed.
+func summarizeConfigChange(incoming map[string]interface{}) string {
+	keys := make([]string, 0, len(incoming))
+	for k := range incoming {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := "changed: "
+	for i, k := range keys {
+		if i > 0 {
+			out += ", "
+		}
+		out += k
+	}
+	return out
+}
 
 func splitProviders(s string) []string {
 	return splitAndTrim(s, ",")

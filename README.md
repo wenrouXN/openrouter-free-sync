@@ -4,15 +4,18 @@ A [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) plugin that 
 
 ## Features
 
-- **Auto-sync on a timer** — configurable interval (default: 24h)
-- **Manual refresh** — one-click from the web panel
-- **Configurable filters** — all via web UI:
-  - Minimum context length (default: 512K)
-  - Pricing filter (`free` = $0 input + $0 output, or `any`)
-  - Excluded providers (default: `openai/,anthropic/,google/` for China region)
-  - Require text output modality
-  - Require tools/function-calling support
-- **Web panel** — view synced models, edit config, trigger refresh
+- **Auto-sync on a timer** — configurable interval (default: 24h), debounced startup (register bursts collapse into one sync)
+- **Manual refresh** — one click from the web panel
+- **Model detail tracking** — context length, modality, input/output pricing, tools support, per-model probe status
+- **Availability probing** — each sync sends a 1-token request per model (rate-limited, default 4s apart to stay under OpenRouter's 20/min free limit):
+  - **404** → quarantined immediately (model gone)
+  - **N consecutive failures (429/5xx/timeout)** → quarantined after threshold (default 3)
+  - **401/403** → treated as *restricted* (e.g. agent-harness-only models), not counted as failure
+  - quarantined models are removed from CPA and re-probed at most every 30 min; automatic recovery on success
+- **Auditable event log** — every change is recorded: `model_added` / `model_removed` / `model_quarantined` / `model_recovered` / `model_readded` / `sync` / `config_updated`, with before/after detail
+- **State persistence** — models + audit log survive CPA restarts (`state_path`)
+- **Configurable filters** — all via web UI: min context length, pricing filter (`free` = $0 in + $0 out), excluded providers, require text output, require tools
+- **Web panel** — three tabs: Models (params + probe status), Audit Log (filterable), Config
 - **Hot-reload** — config changes take effect immediately, no CPA restart
 
 ## How It Works
@@ -94,6 +97,11 @@ plugins:
       provider_name: "openrouter"       # CPA openai-compatibility provider name
       management_key: ""               # CPA mgmt key (empty = use MANAGEMENT_PASSWORD env)
       cpa_base_url: "http://localhost:8317"
+      availability_check: true          # probe model availability each sync
+      availability_fail_threshold: 3    # consecutive failures before quarantine
+      probe_interval_ms: 4000           # delay between probes (stay under 20/min free limit)
+      audit_max_entries: 500            # audit log capacity
+      state_path: "/CLIProxyAPI/state/orfs-state.json"  # persist models + audit log
 ```
 
 ### Prerequisites
@@ -129,7 +137,9 @@ From here you can:
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/v0/management/plugins/openrouter-free-sync/refresh` | Trigger sync now |
-| `GET` | `/v0/management/plugins/openrouter-free-sync/status` | Last sync result |
+| `GET` | `/v0/management/plugins/openrouter-free-sync/status` | Counters + last sync |
+| `GET` | `/v0/management/plugins/openrouter-free-sync/models` | Detailed model metadata + probe status |
+| `GET` | `/v0/management/plugins/openrouter-free-sync/audit?limit=N` | Auditable event log |
 | `GET` | `/v0/management/plugins/openrouter-free-sync/config` | Current config |
 | `PUT` | `/v0/management/plugins/openrouter-free-sync/config` | Update config |
 
