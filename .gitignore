@@ -6,6 +6,9 @@
 /dist/
 /.env
 
+# Local test environment (contains real keys)
+/test-env/
+
 # OS
 .DS_Store
 Thumbs.db
