@@ -241,8 +241,8 @@ func handlePluginRegister(method string, requestBytes []byte) ([]byte, error) {
 		"metadata": map[string]interface{}{
 			"Name":             pluginID,
 			"Version":          pluginVersion,
-			"Author":           "guofukun",
-			"GitHubRepository": "https://github.com/guofukun/openrouter-free-sync",
+			"Author":           "wenrouXN",
+			"GitHubRepository": "https://github.com/wenrouXN/openrouter-free-sync",
 			"ConfigFields":     configFields(),
 		},
 		"capabilities": map[string]interface{}{

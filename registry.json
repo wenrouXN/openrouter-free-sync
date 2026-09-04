@@ -5,8 +5,8 @@
       "name": "OpenRouter Free Model Sync",
       "description": "Auto-sync free OpenRouter models (configurable filters: context length, pricing, provider exclusion) into CPA's openai-compatibility provider. Web panel for config & manual refresh. Background timer for periodic sync.",
       "latest_version": "0.1.0",
-      "author": "guofukun",
-      "github_repository": "https://github.com/guofukun/openrouter-free-sync",
+      "author": "wenrouXN",
+      "github_repository": "https://github.com/wenrouXN/openrouter-free-sync",
       "capabilities": ["management_api"],
       "config_fields": [
         {"name": "refresh_interval", "type": "string", "description": "Auto-sync interval (e.g. 24h, 6h, 1h, 30m)"},

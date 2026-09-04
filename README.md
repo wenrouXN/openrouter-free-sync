@@ -47,7 +47,7 @@ The plugin uses CPA's `management_api` capability and `host.http.do` callback. I
 ### From source
 
 ```bash
-git clone https://github.com/guofukun/openrouter-free-sync.git
+git clone https://github.com/wenrouXN/openrouter-free-sync.git
 cd openrouter-free-sync
 make build
 ```
@@ -63,7 +63,7 @@ cp openrouter-free-sync.so /path/to/cliproxyapi/plugins/
 Add this registry URL to your CPA plugin store sources:
 
 ```
-https://raw.githubusercontent.com/guofukun/openrouter-free-sync/main/registry.json
+https://raw.githubusercontent.com/wenrouXN/openrouter-free-sync/main/registry.json
 ```
 
 Then install via the store UI.
