@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -153,13 +152,8 @@ func fetchOpenRouterModels(cfg PluginConfig) ([]orModel, error) {
 		return nil, fmt.Errorf("openrouter returned %d", resp.StatusCode)
 	}
 
-	body, err := base64.StdEncoding.DecodeString(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("decode body: %w", err)
-	}
-
 	var orResp orModelsResponse
-	if err := json.Unmarshal(body, &orResp); err != nil {
+	if err := json.Unmarshal(resp.Body, &orResp); err != nil {
 		return nil, fmt.Errorf("parse models: %w", err)
 	}
 	return orResp.Data, nil
@@ -187,15 +181,13 @@ func patchCPAProvider(cfg PluginConfig, models []cpaModelEntry) error {
 		return fmt.Errorf("get providers returned %d", resp.StatusCode)
 	}
 
-	body, err := base64.StdEncoding.DecodeString(resp.Body)
-	if err != nil {
-		return fmt.Errorf("decode get response: %w", err)
+	var wrapper struct {
+		OpenAICompatibility cpaCompatResponse `json:"openai-compatibility"`
 	}
-
-	var providers cpaCompatResponse
-	if err := json.Unmarshal(body, &providers); err != nil {
+	if err := json.Unmarshal(resp.Body, &wrapper); err != nil {
 		return fmt.Errorf("parse providers: %w", err)
 	}
+	providers := wrapper.OpenAICompatibility
 
 	// Find the target provider
 	var idx int = -1
@@ -227,14 +219,13 @@ func patchCPAProvider(cfg PluginConfig, models []cpaModelEntry) error {
 			"Authorization": {"Bearer " + mgmtKey},
 			"Content-Type":  {"application/json"},
 		},
-		Body: base64.StdEncoding.EncodeToString(patchBody),
+		Body: patchBody,
 	})
 	if err != nil {
 		return fmt.Errorf("patch providers: %w", err)
 	}
 	if patchResp.StatusCode != 200 {
-		patchBody, _ := base64.StdEncoding.DecodeString(patchResp.Body)
-		return fmt.Errorf("patch returned %d: %s", patchResp.StatusCode, string(patchBody))
+		return fmt.Errorf("patch returned %d: %s", patchResp.StatusCode, string(patchResp.Body))
 	}
 
 	return nil

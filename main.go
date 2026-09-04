@@ -81,6 +81,10 @@ type envelopeError struct {
 	Message string `json:"message"`
 }
 
+type lifecycleRequest struct {
+	ConfigYAML []byte `json:"config_yaml"` // auto base64 decoded by Go
+}
+
 // --- Management API types ---
 
 type managementRequest struct {
@@ -88,13 +92,13 @@ type managementRequest struct {
 	Path    string              `json:"Path"`
 	Headers map[string][]string `json:"Headers,omitempty"`
 	Query   map[string][]string `json:"Query,omitempty"`
-	Body    string              `json:"Body,omitempty"`
+	Body    []byte              `json:"Body,omitempty"` // auto base64 decoded by Go
 }
 
 type managementResponse struct {
 	StatusCode int                 `json:"StatusCode"`
 	Headers     map[string][]string `json:"Headers,omitempty"`
-	Body        string              `json:"Body,omitempty"`
+	Body        []byte              `json:"Body,omitempty"` // auto base64 encoded by Go
 }
 
 type managementRoute struct {
@@ -119,13 +123,13 @@ type httpDoRequest struct {
 	Method  string              `json:"method"`
 	URL     string              `json:"url"`
 	Headers map[string][]string `json:"headers,omitempty"`
-	Body    string              `json:"body,omitempty"`
+	Body    []byte              `json:"body,omitempty"` // auto base64 by Go
 }
 
 type httpDoResponse struct {
-	StatusCode int                 `json:"status_code"`
-	Headers     map[string][]string `json:"headers,omitempty"`
-	Body        string              `json:"body,omitempty"`
+	StatusCode int                 `json:"StatusCode"`
+	Headers     map[string][]string `json:"Headers,omitempty"`
+	Body        []byte              `json:"Body,omitempty"` // auto base64 decoded by Go
 }
 
 // --- Global state ---
@@ -207,10 +211,18 @@ func handleMethod(method string, requestBytes []byte) ([]byte, error) {
 }
 
 func handlePluginRegister(method string, requestBytes []byte) ([]byte, error) {
-	// Parse config from request
-	newCfg, err := parseConfig(requestBytes)
+	// Parse lifecycle request: {"config_yaml": "<base64 yaml>"}
+	var lcReq lifecycleRequest
+	var cfgYAML []byte
+	if len(requestBytes) > 0 {
+		if err := json.Unmarshal(requestBytes, &lcReq); err == nil {
+			cfgYAML = lcReq.ConfigYAML
+		}
+	}
+
+	newCfg, err := parseConfig(cfgYAML)
 	if err != nil {
-		// If parse fails, use defaults
+		hostLog("warn", "openrouter-free-sync: config parse failed, using defaults: "+err.Error())
 		newCfg = defaultConfig()
 	}
 
@@ -319,9 +331,9 @@ func handleGetConfig() managementResponse {
 }
 
 func handlePutConfig(req managementRequest) managementResponse {
-	body, err := base64Decode(req.Body)
-	if err != nil {
-		return errorResponse(400, "invalid body: "+err.Error())
+	body := req.Body
+	if len(body) == 0 {
+		return errorResponse(400, "empty body")
 	}
 
 	var incoming map[string]interface{}
@@ -507,13 +519,6 @@ func jsonMarshal(v interface{}) ([]byte, error) {
 	return json.Marshal(v)
 }
 
-func base64Decode(s string) ([]byte, error) {
-	if s == "" {
-		return nil, nil
-	}
-	return base64StdDecode(s)
-}
-
 // --- Envelope helpers ---
 
 func okEnvelope(v interface{}) ([]byte, error) {
@@ -548,7 +553,7 @@ func mgmtJSON(v interface{}) managementResponse {
 	return managementResponse{
 		StatusCode: 200,
 		Headers:   map[string][]string{"Content-Type": {"application/json"}},
-		Body:      base64StdEncode(data),
+		Body:      data,
 	}
 }
 

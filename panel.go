@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"fmt"
 	"strings"
 	"time"
@@ -182,7 +181,7 @@ func renderPanelResponse(pluginID string) managementResponse {
 	return managementResponse{
 		StatusCode: 200,
 		Headers:    map[string][]string{"Content-Type": {"text/html; charset=utf-8"}},
-		Body:       base64.StdEncoding.EncodeToString([]byte(html)),
+		Body:       []byte(html),
 	}
 }
 
@@ -190,12 +189,12 @@ func renderPanelResponse(pluginID string) managementResponse {
 func jsonResponse(v interface{}) (managementResponse, error) {
 	data, err := jsonMarshal(v)
 	if err != nil {
-		return managementResponse{StatusCode: 500, Headers: map[string][]string{"Content-Type": {"application/json"}}, Body: base64.StdEncoding.EncodeToString([]byte(`{"error":"` + err.Error() + `"}`))}, err
+		return managementResponse{StatusCode: 500, Headers: map[string][]string{"Content-Type": {"application/json"}}, Body: []byte(`{"error":"` + err.Error() + `"}`)}, err
 	}
 	return managementResponse{
 		StatusCode: 200,
 		Headers:    map[string][]string{"Content-Type": {"application/json"}},
-		Body:       base64.StdEncoding.EncodeToString(data),
+		Body:       data,
 	}, nil
 }
 
@@ -205,7 +204,7 @@ func errorResponse(code int, msg string) managementResponse {
 	return managementResponse{
 		StatusCode: code,
 		Headers:    map[string][]string{"Content-Type": {"application/json"}},
-		Body:       base64.StdEncoding.EncodeToString(body),
+		Body:       body,
 	}
 }
 
