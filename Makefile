@@ -1,13 +1,11 @@
 PLUGIN_ID = openrouter-free-sync
 VERSION = 0.1.0
-GOFLAGS = -trimpath -buildmode=c-shared
+GOFLAGS = -trimpath -buildvcs=false
 
-.PHONY: build clean test all
-
-all: build
+.PHONY: build clean test
 
 build:
-	go build $(GOFLAGS) -o $(PLUGIN_ID).so .
+	go build $(GOFLAGS) -buildmode=c-shared -o $(PLUGIN_ID).so .
 
 clean:
 	rm -f $(PLUGIN_ID).so $(PLUGIN_ID).h
@@ -15,13 +13,7 @@ clean:
 test:
 	go test ./... -v
 
-# Cross-compile helpers (requires GOOS/GOARCH env)
-build-all: clean
-	GOOS=linux   GOARCH=amd64 go build $(GOFLAGS) -o dist/$(PLUGIN_ID)_$(VERSION)_linux_amd64.so .
-	GOOS=linux   GOARCH=arm64 go build $(GOFLAGS) -o dist/$(PLUGIN_ID)_$(VERSION)_linux_arm64.so .
-	GOOS=darwin  GOARCH=amd64 go build $(GOFLAGS) -o dist/$(PLUGIN_ID)_$(VERSION)_darwin_amd64.dylib .
-	GOOS=darwin  GOARCH=arm64 go build $(GOFLAGS) -o dist/$(PLUGIN_ID)_$(VERSION)_darwin_arm64.dylib .
-	GOOS=windows GOARCH=amd64 go build $(GOFLAGS) -o dist/$(PLUGIN_ID)_$(VERSION)_windows_amd64.dll .
-	GOOS=windows GOARCH=arm64 go build $(GOFLAGS) -o dist/$(PLUGIN_ID)_$(VERSION)_windows_arm64.dll .
-	GOOS=freebsd GOARCH=amd64 go build $(GOFLAGS) -o dist/$(PLUGIN_ID)_$(VERSION)_freebsd_amd64.so .
-	cd dist && sha256sum * > checksums.txt
+# Docker-based build (host has no Go installed)
+build-docker:
+	docker run --rm -v "$$(pwd):/src" -w /src golang:1.24-bookworm bash -c \
+		"apt-get update -qq && apt-get install -y -qq gcc >/dev/null && CGO_ENABLED=1 go build -trimpath -buildvcs=false -buildmode=c-shared -o $(PLUGIN_ID).so ."
