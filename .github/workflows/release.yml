@@ -8,37 +8,23 @@ on:
     inputs:
       version:
         description: 'Version (e.g. 0.1.0)'
-        required: true
-        default: '0.1.0'
+        required: false
 
 jobs:
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - goos: linux
-            goarch: amd64
-            ext: so
-          - goos: linux
-            goarch: arm64
-            ext: so
-          - goos: darwin
-            goarch: amd64
-            ext: dylib
-          - goos: darwin
-            goarch: arm64
-            ext: dylib
-          - goos: windows
-            goarch: amd64
-            ext: dll
-          - goos: windows
-            goarch: arm64
-            ext: dll
-          - goos: freebsd
-            goarch: amd64
-            ext: so
+          - { goos: linux,   goarch: amd64, ext: so,    zig: x86_64-linux-gnu }
+          - { goos: linux,   goarch: arm64, ext: so,    zig: aarch64-linux-gnu }
+          - { goos: darwin,  goarch: amd64, ext: dylib, zig: x86_64-macos }
+          - { goos: darwin,  goarch: arm64, ext: dylib, zig: aarch64-macos }
+          - { goos: windows, goarch: amd64, ext: dll,   zig: x86_64-windows-gnu }
+          - { goos: windows, goarch: arm64, ext: dll,   zig: aarch64-windows-gnu }
+          - { goos: freebsd, goarch: amd64, ext: so,    zig: x86_64-freebsd }
     steps:
       - uses: actions/checkout@v4
 
@@ -46,33 +32,32 @@ jobs:
         with:
           go-version: '1.24'
 
-      - name: Install cross-compilation toolchain
-        if: matrix.goarch == 'arm64' && matrix.goos != 'darwin'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CC=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+      # zig cc as universal cross C compiler for CGO
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: '0.13.0'
 
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 1
+          CGO_ENABLED: '1'
+          CC: zig cc -target ${{ matrix.zig }}
         run: |
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          [ -n "$VERSION" ] || VERSION="0.0.0-dev"
           mkdir -p dist
-          PLUGIN_ID=openrouter-free-sync
-          VERSION=${{ github.event.inputs.version || github.ref_name }}
-          # strip leading 'v' from tag
-          VERSION=${VERSION#v}
-          OUTPUT="dist/${PLUGIN_ID}_${VERSION}_${GOOS}_${GOARCH}.${{ matrix.ext }}"
-          go build -trimpath -buildmode=c-shared -ldflags="-s -w" -o "$OUTPUT" .
-          ls -la "$OUTPUT"
+          OUT="dist/openrouter-free-sync_${VERSION}_${GOOS}_${GOARCH}.${{ matrix.ext }}"
+          go build -trimpath -buildmode=c-shared -buildvcs=false -ldflags="-s -w" -o "$OUT" .
+          ls -la "$OUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: openrouter-free-sync-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
+          if-no-files-found: error
 
   release:
     name: Create Release
@@ -80,8 +65,6 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v4
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
