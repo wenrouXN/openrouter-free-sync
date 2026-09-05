@@ -66,6 +66,11 @@ type SyncResult struct {
 	Quarantined int    `json:"quarantined"`
 	Recovered   int    `json:"recovered"`
 	Probed      int    `json:"probed"`
+	// changed model IDs, included in API responses and sync audit entries
+	AddedIDs       []string `json:"added_ids,omitempty"`
+	RemovedIDs     []string `json:"removed_ids,omitempty"`
+	QuarantinedIDs []string `json:"quarantined_ids,omitempty"`
+	RecoveredIDs   []string `json:"recovered_ids,omitempty"`
 }
 
 var (
@@ -120,6 +125,18 @@ func isExcluded(id string, prefixes []string) bool {
 	return false
 }
 
+// autoAlias derives a short alias from a model ID:
+// "dots-studio/dots-3-note-preview:free" → "dots-3-note-preview",
+// "minimax/minimax-m3:free" → "minimax-m3".
+func autoAlias(id string) string {
+	s := id
+	if i := strings.LastIndex(s, "/"); i >= 0 {
+		s = s[i+1:]
+	}
+	s = strings.TrimSuffix(s, ":free")
+	return s
+}
+
 // filterModels applies config filters to the OpenRouter model list.
 func filterModels(models []orModel, cfg PluginConfig) []cpaModelEntry {
 	var result []cpaModelEntry
@@ -139,7 +156,11 @@ func filterModels(models []orModel, cfg PluginConfig) []cpaModelEntry {
 		if cfg.RequireToolsSupport && !hasToolsSupport(m.SupportedParams) {
 			continue
 		}
-		result = append(result, cpaModelEntry{Name: m.ID, Alias: m.ID})
+		alias := m.ID
+		if cfg.AutoAlias {
+			alias = autoAlias(m.ID)
+		}
+		result = append(result, cpaModelEntry{Name: m.ID, Alias: alias})
 	}
 	return result
 }
@@ -312,6 +333,7 @@ func runSync(cfg PluginConfig) SyncResult {
 			auditAddLocked("model_added", m.Name,
 				fmt.Sprintf("ctx=%d modality=%s price=%s/%s", om.ContextLength, om.Architecture.Modality, om.Pricing.Prompt, om.Pricing.Completion))
 			result.Added++
+			result.AddedIDs = append(result.AddedIDs, m.Name)
 		} else {
 			om := orByID[m.Name]
 			rec.DisplayName = om.Name
@@ -324,6 +346,7 @@ func runSync(cfg PluginConfig) SyncResult {
 				rec.Active = true
 				auditAddLocked("model_readded", m.Name, "matches filters again")
 				result.Added++
+				result.AddedIDs = append(result.AddedIDs, m.Name)
 			}
 		}
 	}
@@ -336,6 +359,7 @@ func runSync(cfg PluginConfig) SyncResult {
 			rec.FailCount = 0
 			auditAddLocked("model_removed", id, "no longer matches filters or left OpenRouter catalog")
 			result.Removed++
+			result.RemovedIDs = append(result.RemovedIDs, id)
 		}
 		if !rec.Active {
 			continue
@@ -397,6 +421,7 @@ func runSync(cfg PluginConfig) SyncResult {
 				rec.FailCount = 0
 				auditAddLocked("model_recovered", id, "401/403 restriction no longer counted as failure")
 				result.Recovered++
+                result.RecoveredIDs = append(result.RecoveredIDs, id)
 			}
 			continue
 		}
@@ -405,6 +430,7 @@ func runSync(cfg PluginConfig) SyncResult {
 				rec.QuarantineReason = ""
 				auditAddLocked("model_recovered", id, "probe OK, restored to CPA provider")
 				result.Recovered++
+                result.RecoveredIDs = append(result.RecoveredIDs, id)
 			}
 			rec.FailCount = 0
 			continue
@@ -415,6 +441,7 @@ func runSync(cfg PluginConfig) SyncResult {
 				rec.QuarantineReason = "model not found (404)"
 				auditAddLocked("model_quarantined", id, rec.QuarantineReason)
 				result.Quarantined++
+				result.QuarantinedIDs = append(result.QuarantinedIDs, id)
 			}
 			continue
 		}
@@ -422,12 +449,13 @@ func runSync(cfg PluginConfig) SyncResult {
 			rec.QuarantineReason = fmt.Sprintf("%d consecutive probe failures (last: %s)", rec.FailCount, pr.errMsg)
 			auditAddLocked("model_quarantined", id, rec.QuarantineReason)
 			result.Quarantined++
+			result.QuarantinedIDs = append(result.QuarantinedIDs, id)
 		}
 	}
 	var final []cpaModelEntry
 	for _, m := range filtered {
 		if rec := st.Models[m.Name]; rec != nil && rec.QuarantineReason == "" {
-			final = append(final, cpaModelEntry{Name: m.Name, Alias: m.Name})
+			final = append(final, m) // m already carries the auto-generated alias
 		}
 	}
 	result.ModelCount = len(final)
@@ -459,12 +487,28 @@ func finishSync(result SyncResult) {
 			Error:       result.Error,
 			ActiveCount: result.ModelCount,
 		}
-		detail := fmt.Sprintf("models=%d added=%d removed=%d quarantined=%d recovered=%d probed=%d",
+		detail := fmt.Sprintf("active=%d added=%d removed=%d quarantined=%d recovered=%d probed=%d",
 			result.ModelCount, result.Added, result.Removed, result.Quarantined, result.Recovered, result.Probed)
+		var parts []string
+		if len(result.AddedIDs) > 0 {
+			parts = append(parts, "added: "+strings.Join(result.AddedIDs, ", "))
+		}
+		if len(result.RemovedIDs) > 0 {
+			parts = append(parts, "removed: "+strings.Join(result.RemovedIDs, ", "))
+		}
+		if len(result.QuarantinedIDs) > 0 {
+			parts = append(parts, "quarantined: "+strings.Join(result.QuarantinedIDs, ", "))
+		}
+		if len(result.RecoveredIDs) > 0 {
+			parts = append(parts, "recovered: "+strings.Join(result.RecoveredIDs, ", "))
+		}
+		if len(parts) > 0 {
+			detail += " | " + strings.Join(parts, " ; ")
+		}
 		if result.Error != "" {
 			detail += " error=" + result.Error
 		}
-		auditAddLocked("sync", "", detail)
+		auditAddLocked("sync", fmt.Sprintf("%d active", result.ModelCount), detail)
 		stateSaveLocked()
 	}
 	stateMu.Unlock()

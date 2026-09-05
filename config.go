@@ -2,8 +2,10 @@ package main
 
 import (
 	"os"
+	"strings"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
 )
 
@@ -20,6 +22,7 @@ type PluginConfig struct {
 	ProviderName        string   `yaml:"provider_name"`
 	ManagementKey       string   `yaml:"management_key"`
 	CPABaseURL          string   `yaml:"cpa_base_url"`
+	AutoAlias           bool     `yaml:"auto_alias"`
 	// v0.2.0: availability probing, audit log, state persistence
 	AvailabilityCheck         bool   `yaml:"availability_check"`
 	AvailabilityFailThreshold int    `yaml:"availability_fail_threshold"`
@@ -39,6 +42,7 @@ func defaultConfig() PluginConfig {
 		OpenRouterBaseURL:         "https://openrouter.ai/api/v1",
 		ProviderName:              "openrouter",
 		CPABaseURL:                "http://localhost:8317",
+		AutoAlias:                 true,
 		AvailabilityCheck:         true,
 		AvailabilityFailThreshold: 3,
 		ProbeIntervalMS:           4000,
@@ -64,6 +68,19 @@ func (c PluginConfig) RefreshDuration() time.Duration {
 	return d
 }
 
+// parseSchedule detects whether refresh_interval is a cron expression
+// (contains whitespace) or a Go duration. Returns (schedule, expr, isCron).
+func parseSchedule(s string) (cron.Schedule, string, bool) {
+	s = strings.TrimSpace(s)
+	if strings.ContainsAny(s, " \t") {
+		if sched, err := cron.ParseStandard(s); err == nil {
+			return sched, s, true
+		}
+		hostLog("warn", "openrouter-free-sync: invalid cron expr '"+s+"', falling back to interval mode")
+	}
+	return nil, s, false
+}
+
 func (c PluginConfig) effectiveManagementKey() string {
 	if c.ManagementKey != "" {
 		return c.ManagementKey
@@ -81,7 +98,7 @@ func (c PluginConfig) failThreshold() int {
 // configFields returns CPA ConfigFields for web rendering.
 func configFields() []map[string]interface{} {
 	return []map[string]interface{}{
-		{"Name": "refresh_interval", "Type": "string", "Description": "Auto-sync interval (e.g. 24h, 6h, 1h, 30m)"},
+		{"Name": "refresh_interval", "Type": "string", "Description": "Go duration (24h) or cron expr — '0 9 * * 1' = every Monday 09:00, container TZ"},
 		{"Name": "min_context_length", "Type": "integer", "Description": "Minimum context length filter"},
 		{"Name": "pricing_filter", "Type": "enum", "EnumValues": []string{"free", "any"}, "Description": "free = $0 input + $0 output; any = include all"},
 		{"Name": "excluded_providers", "Type": "string", "Description": "Comma-separated provider prefixes to exclude"},
@@ -92,6 +109,7 @@ func configFields() []map[string]interface{} {
 		{"Name": "provider_name", "Type": "string", "Description": "CPA openai-compatibility provider name to sync into"},
 		{"Name": "management_key", "Type": "string", "Description": "CPA management API key (empty = MANAGEMENT_PASSWORD env)"},
 		{"Name": "cpa_base_url", "Type": "string", "Description": "CPA base URL for management API"},
+		{"Name": "auto_alias", "Type": "boolean", "Description": "Generate short aliases: vendor/model:free → model (default on)"},
 		{"Name": "availability_check", "Type": "boolean", "Description": "Probe each model with a 1-token request each sync; quarantine after N consecutive failures"},
 		{"Name": "availability_fail_threshold", "Type": "integer", "Description": "Consecutive probe failures before a model is quarantined (removed from CPA)"},
 		{"Name": "probe_interval_ms", "Type": "integer", "Description": "Delay between per-model probes in ms (default 4000, keeps under OpenRouter 20/min free limit)"},

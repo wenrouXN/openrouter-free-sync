@@ -68,7 +68,7 @@ import (
 
 const abiVersion uint32 = 1
 const pluginID = "openrouter-free-sync"
-const pluginVersion = "0.2.1"
+const pluginVersion = "0.3.0"
 
 // --- JSON envelope ---
 
@@ -392,6 +392,7 @@ func handleGetConfig() managementResponse {
 		"provider_name":         c.ProviderName,
 		"management_key":        c.ManagementKey,
 		"cpa_base_url":          c.CPABaseURL,
+		"auto_alias":            c.AutoAlias,
 		"availability_check":    c.AvailabilityCheck,
 		"availability_fail_threshold": c.AvailabilityFailThreshold,
 		"probe_interval_ms":     c.ProbeIntervalMS,
@@ -450,6 +451,9 @@ func handlePutConfig(req managementRequest) managementResponse {
 	if v, ok := incoming["cpa_base_url"].(string); ok {
 		newCfg.CPABaseURL = v
 	}
+	if v, ok := incoming["auto_alias"].(bool); ok {
+		newCfg.AutoAlias = v
+	}
 	if v, ok := incoming["availability_check"].(bool); ok {
 		newCfg.AvailabilityCheck = v
 	}
@@ -488,13 +492,9 @@ func handlePutConfig(req managementRequest) managementResponse {
 // --- Ticker management ---
 
 func startTicker(c PluginConfig) {
-	d := c.RefreshDuration()
 	tickerDone = make(chan struct{})
-	ticker = time.NewTicker(d)
 
 	go func() {
-		hostLog("info", fmt.Sprintf("openrouter-free-sync: ticker started, interval=%s", formatDuration(d)))
-
 		// Debounced initial sync: register/reconfigure bursts collapse into one run.
 		debounceTimer = time.AfterFunc(3*time.Second, func() {
 			cfgMu.Lock()
@@ -504,6 +504,30 @@ func startTicker(c PluginConfig) {
 			setLastSync(result)
 		})
 
+		// Cron mode: refresh_interval containing whitespace is parsed as standard cron.
+		if sched, expr, ok := parseSchedule(c.RefreshInterval); ok {
+			hostLog("info", fmt.Sprintf("openrouter-free-sync: scheduler started, cron=%q (container TZ)", expr))
+			for {
+				next := sched.Next(time.Now())
+				timer := time.NewTimer(time.Until(next))
+				select {
+				case <-tickerDone:
+					timer.Stop()
+					return
+				case <-timer.C:
+					cfgMu.Lock()
+					currentCfg := cfg
+					cfgMu.Unlock()
+					result := runSyncSerialized(currentCfg)
+					setLastSync(result)
+				}
+			}
+		}
+
+		// Interval mode (fallback).
+		d := c.RefreshDuration()
+		hostLog("info", fmt.Sprintf("openrouter-free-sync: scheduler started, interval=%s", formatDuration(d)))
+		ticker = time.NewTicker(d)
 		for {
 			select {
 			case <-tickerDone:
