@@ -55,7 +55,7 @@ tr.dead td{opacity:0.45}
 </head>
 <body>
 <h1>🔄 OpenRouter Free Sync</h1>
-<p class="sub">Auto-sync free OpenRouter models into CPA openai-compatibility provider · v0.4.0</p>
+<p class="sub">Auto-sync free OpenRouter models into CPA openai-compatibility provider · v0.5.0</p>
 
 <div class="card">
   <h2>Management Key</h2>
@@ -81,10 +81,18 @@ tr.dead td{opacity:0.45}
   </div>
 
   <div id="tab-models">
+    <div class="toolbar">
+      <span class="log-count" id="modelToolbarInfo"></span>
+      <span>
+        <button class="btn" onclick="doPreview()" style="margin-right:6px">🔍 Preview Filters</button>
+        <a class="btn" href="/v0/management/plugins/openrouter-free-sync/audit?format=csv&limit=1000" style="text-decoration:none;display:inline-block">⬇ Export CSV</a>
+      </span>
+    </div>
+    <div id="previewBox" class="hidden" style="background:#11141a;border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:10px;font-size:12.5px"></div>
     <table id="modelTable">
       <thead><tr>
         <th>Status</th><th>Model ID</th><th>Context</th><th>Modality</th>
-        <th>Price in/out ($/M)</th><th>Tools</th><th>Probe</th><th>Added</th>
+        <th>Price in/out ($/M)</th><th>Tools</th><th>Probe</th><th>Added</th><th></th>
       </tr></thead>
       <tbody></tbody>
     </table>
@@ -203,17 +211,25 @@ async function loadModels() {
         if (!m.last_probe_ok && m.last_probe_error) probe += '<div class="qr">'+esc(m.last_probe_error.slice(0,120))+'</div>';
       }
       let failInfo = m.fail_count>0 ? '<div class="qr">fails: '+m.fail_count+'</div>' : '';
-      return '<tr'+cls+'><td>'+status+failInfo+'</td>'
+      let hist = '';
+      if (m.probe_history && m.probe_history.length) {
+        let dots = m.probe_history.slice(-12).map(h => h.ok ? '<span style="color:var(--green)">●</span>' : '<span style="color:var(--yellow)">●</span>').join('');
+        let lastH = m.probe_history[m.probe_history.length-1];
+        hist = '<div class="log-count" title="recent probes (oldest→newest)">'+dots+' '+lastH.latency_ms+'ms</div>';
+      }
+      let probeBtn = m.active ? '<button class="btn" style="padding:3px 8px;font-size:11px" onclick="probeOne(\''+m.id+'\')">probe</button>' : '';
+      return '<tr'+cls+'><td>'+status+failInfo+hist+'</td>'
         + '<td class="mono">'+esc(m.id)+(m.display_name?'<br><span class="log-count">'+esc(m.display_name)+'</span>':'')+'</td>'
         + '<td>'+ctxFmt(m.context_length)+'</td>'
         + '<td class="mono">'+esc(m.modality||"-")+'</td>'
         + '<td>'+priceFmt(m.input_price)+' / '+priceFmt(m.output_price)+'</td>'
         + '<td>'+(m.tools?'<span class="badge ok">tools</span>':'<span class="badge muted">no</span>')+'</td>'
         + '<td>'+probe+'</td>'
-        + '<td class="log-count">'+tFmt(m.added_at)+'</td></tr>';
-    }).join("") || '<tr><td colspan="8" class="log-count">no models tracked yet — run a sync</td></tr>';
+        + '<td class="log-count">'+tFmt(m.added_at)+'</td>'
+        + '<td>'+probeBtn+'</td></tr>';
+    }).join("") || '<tr><td colspan="9" class="log-count">no models tracked yet — run a sync</td></tr>';
   } catch(e) {
-    document.querySelector("#modelTable tbody").innerHTML = '<tr><td colspan="8"><span class="badge fail">Error</span> '+esc(e.message)+'</td></tr>';
+    document.querySelector("#modelTable tbody").innerHTML = '<tr><td colspan="9"><span class="badge fail">Error</span> '+esc(e.message)+'</td></tr>';
   }
 }
 
@@ -243,6 +259,9 @@ const CFG_FIELDS = [
   ["availability_check","checkbox"],["availability_fail_threshold","number"],
   ["probe_interval_ms","number"],["probe_cooldown_min","number"],
   ["audit_sync_always","checkbox"],["audit_max_entries","number"],["prune_after_days","number"],
+  ["exclude_models","text"],["force_include","text"],
+  ["alias_prefix","text"],["alias_overrides","text"],
+  ["require_input_modality","text"],["require_params","text"],["probe_history_size","number"],
   ["state_path","text"]
 ];
 async function loadConfig() {
@@ -285,6 +304,48 @@ async function doRefresh() {
   } catch(e) { alert("Refresh failed: " + e.message); }
   btn.disabled = false; btn.innerHTML = "🔄 Sync Now";
   loadStatus(); loadModels(); loadAudit();
+}
+
+async function doPreview() {
+  let box = document.getElementById("previewBox");
+  box.classList.remove("hidden");
+  box.innerHTML = '<span class="spinner"></span> Previewing…';
+  // send current form values (if config tab was edited) so preview reflects unsaved edits
+  let overrides = {};
+  CFG_FIELDS.forEach(([k,t]) => {
+    let el = document.getElementById("cfg_"+k);
+    if (!el) return;
+    if (t==="checkbox") overrides[k] = el.checked;
+    else if (t==="number") overrides[k] = parseInt(el.value)||0;
+    else overrides[k] = el.value;
+  });
+  overrides["excluded_providers"] = (overrides["excluded_providers"]||"").split(",").map(s=>s.trim()).filter(Boolean);
+  overrides["exclude_models"] = (overrides["exclude_models"]||"").split(",").map(s=>s.trim()).filter(Boolean);
+  overrides["force_include"] = (overrides["force_include"]||"").split(",").map(s=>s.trim()).filter(Boolean);
+  overrides["require_params"] = (overrides["require_params"]||"").split(",").map(s=>s.trim()).filter(Boolean);
+  try {
+    let r = await fetch(BASE + "/preview", {method:"POST", headers: headers(), body: JSON.stringify(overrides)});
+    if (!r.ok) throw new Error(r.status + " " + (await r.text()).slice(0,150));
+    let d = await r.json();
+    let add = (d.would_add||[]), rem = (d.would_remove||[]);
+    box.innerHTML = '<b>'+(d.would_sync||[]).length+'</b> of '+d.total_catalog+' catalog models would sync'
+      + ' · <span style="color:var(--green)">+'+add.length+' to add</span>'
+      + ' · <span style="color:var(--red)">-'+rem.length+' to remove</span>'
+      + (add.length ? '<br><span class="log-count">add: '+esc(add.join(", "))+'</span>' : '')
+      + (rem.length ? '<br><span class="log-count">remove: '+esc(rem.join(", "))+'</span>' : '')
+      + '<br><span class="log-count">(dry-run only — nothing changed)</span>';
+  } catch(e) {
+    box.innerHTML = '<span class="badge fail">Error</span> ' + esc(e.message);
+  }
+}
+
+async function probeOne(id) {
+  if (!confirm("Probe " + id + " now?")) return;
+  try {
+    let d = await api("POST", "/probe", {model: id});
+    alert((d.ok ? "OK " : "FAIL ") + d.status + " · " + d.latency_ms + "ms" + (d.error ? "\n" + d.error : ""));
+    loadModels(); loadAudit();
+  } catch(e) { alert("Probe failed: " + e.message); }
 }
 
 loadKeyUI(); loadStatus(); loadModels(); loadAudit(); loadConfig();

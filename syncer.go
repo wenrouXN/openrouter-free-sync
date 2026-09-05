@@ -139,13 +139,106 @@ func autoAlias(id string) string {
 	return s
 }
 
-// filterModels applies config filters to the OpenRouter model list.
-// When auto-aliases collide (two vendors exposing the same short name),
-// the colliding models fall back to their full IDs instead of silently
-// overwriting each other in CPA.
+// toSet converts a string slice to a set.
+func toSet(list []string) map[string]bool {
+	out := make(map[string]bool, len(list))
+	for _, s := range list {
+		if s != "" {
+			out[s] = true
+		}
+	}
+	return out
+}
+
+// hasInputModality reports whether the model accepts the given input modality.
+func hasInputModality(a orArchitecture, modality string) bool {
+	for _, m := range a.InputModalities {
+		if m == modality {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAllParams reports whether every required parameter is supported.
+func hasAllParams(params, required []string) bool {
+	set := toSet(params)
+	for _, r := range required {
+		if !set[r] {
+			return false
+		}
+	}
+	return true
+}
+
+// parseAliasOverrides parses "model-id=alias,model2=alias2" into a map.
+func parseAliasOverrides(s string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range splitAndTrim(s, ",") {
+		if i := strings.Index(pair, "="); i > 0 {
+			id := strings.TrimSpace(pair[:i])
+			alias := strings.TrimSpace(pair[i+1:])
+			if id != "" && alias != "" {
+				out[id] = alias
+			}
+		}
+	}
+	return out
+}
+
+// resolveAliasMap computes the final alias per model ID. Precedence:
+// manual alias_overrides > prefix+auto short name (collision -> full ID).
+func resolveAliasMap(models []orModel, cfg PluginConfig) map[string]string {
+	overrides := parseAliasOverrides(cfg.AliasOverrides)
+	shortCount := map[string]int{}
+	for _, m := range models {
+		shortCount[autoAlias(m.ID)]++
+	}
+	out := make(map[string]string, len(models))
+	collisions := 0
+	for _, m := range models {
+		if a, ok := overrides[m.ID]; ok {
+			out[m.ID] = a
+			continue
+		}
+		if cfg.AutoAlias {
+			name := autoAlias(m.ID)
+			if cfg.AliasPrefix != "" {
+				name = cfg.AliasPrefix + name
+			}
+			if shortCount[autoAlias(m.ID)] > 1 {
+				collisions++
+				out[m.ID] = m.ID // short alias ambiguous, keep full ID
+			} else {
+				out[m.ID] = name
+			}
+		} else {
+			out[m.ID] = m.ID
+		}
+	}
+	if collisions > 0 {
+		hostLog("warn", "openrouter-free-sync: "+fmt.Sprint(collisions)+" auto-alias collision(s), falling back to full model IDs")
+	}
+	return out
+}
+
+// filterModels applies filters with per-model overrides. Precedence:
+// blacklist (never synced) > whitelist (always synced, filters bypassed)
+// > standard filters. Whitelist still requires the model to exist in the
+// OpenRouter catalog; it cannot conjure IDs OpenRouter does not list.
 func filterModels(models []orModel, cfg PluginConfig) []cpaModelEntry {
+	black := toSet(cfg.ExcludeModels)
+	white := toSet(cfg.ForceInclude)
+
 	var passing []orModel
 	for _, m := range models {
+		if black[m.ID] {
+			continue
+		}
+		if white[m.ID] {
+			passing = append(passing, m)
+			continue
+		}
 		if m.ContextLength < cfg.MinContextLength {
 			continue
 		}
@@ -161,31 +254,19 @@ func filterModels(models []orModel, cfg PluginConfig) []cpaModelEntry {
 		if cfg.RequireToolsSupport && !hasToolsSupport(m.SupportedParams) {
 			continue
 		}
+		if cfg.RequireInputModality != "" && !hasInputModality(m.Architecture, cfg.RequireInputModality) {
+			continue
+		}
+		if len(cfg.RequireParams) > 0 && !hasAllParams(m.SupportedParams, cfg.RequireParams) {
+			continue
+		}
 		passing = append(passing, m)
 	}
 
-	aliasCount := map[string]int{}
+	aliases := resolveAliasMap(passing, cfg)
+	result := make([]cpaModelEntry, 0, len(passing))
 	for _, m := range passing {
-		aliasCount[autoAlias(m.ID)]++
-	}
-
-	var result []cpaModelEntry
-	collisions := 0
-	for _, m := range passing {
-		alias := m.ID
-		if cfg.AutoAlias {
-			short := autoAlias(m.ID)
-			if aliasCount[short] > 1 {
-				collisions++
-				// keep full ID: short alias is ambiguous
-			} else {
-				alias = short
-			}
-		}
-		result = append(result, cpaModelEntry{Name: m.ID, Alias: alias})
-	}
-	if collisions > 0 {
-		hostLog("warn", "openrouter-free-sync: "+fmt.Sprint(collisions)+" auto-alias collision(s), falling back to full model IDs")
+		result = append(result, cpaModelEntry{Name: m.ID, Alias: aliases[m.ID]})
 	}
 	return result
 }
@@ -482,6 +563,7 @@ func runSync(cfg PluginConfig) SyncResult {
 		rec.LastProbeStatus = pr.status
 		rec.LastProbeLatency = pr.latency
 		rec.LastProbeError = pr.errMsg
+		appendProbeHistory(rec, ProbeEntry{Time: rec.LastProbeAt, OK: pr.ok, Status: pr.status, LatencyMS: pr.latency}, cfg.ProbeHistorySize)
 		if pr.status == 401 || pr.status == 403 {
 			// auth / agent-harness restriction, not an availability failure
 			rec.Restricted = true
@@ -613,4 +695,97 @@ func setLastSync(r SyncResult) {
 	syncMu.Lock()
 	defer syncMu.Unlock()
 	lastSync = r
+}
+
+// PreviewResult is the outcome of a dry-run filter preview.
+type PreviewResult struct {
+	WouldSync    []cpaModelEntry `json:"would_sync"`
+	WouldAdd     []string        `json:"would_add,omitempty"`
+	WouldRemove  []string        `json:"would_remove,omitempty"`
+	TotalCatalog int             `json:"total_catalog"`
+}
+
+// runPreview fetches the live catalog and applies cfg (optionally overlaid
+// with incoming field overrides) without touching CPA or probe state.
+func runPreview(cfg PluginConfig, overrides map[string]interface{}) (PreviewResult, error) {
+	var res PreviewResult
+	models, err := fetchOpenRouterModels(cfg)
+	if err != nil {
+		return res, err
+	}
+	res.TotalCatalog = len(models)
+	eff := cfg
+	if len(overrides) > 0 {
+		applyConfigFields(&eff, overrides)
+	}
+	res.WouldSync = filterModels(models, eff)
+
+	desired := map[string]bool{}
+	for _, m := range res.WouldSync {
+		desired[m.Name] = true
+	}
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if st != nil {
+		for id, rec := range st.Models {
+			if rec.Active && !desired[id] {
+				res.WouldRemove = append(res.WouldRemove, id)
+			}
+		}
+		for _, m := range res.WouldSync {
+			if rec := st.Models[m.Name]; rec == nil || !rec.Active {
+				res.WouldAdd = append(res.WouldAdd, m.Name)
+			}
+		}
+	}
+	return res, nil
+}
+
+// probeSingleModel probes one tracked model immediately, bypassing cooldowns.
+// Records history + audit; quarantine/recovery takes effect at next sync PATCH.
+func probeSingleModel(cfg PluginConfig, id string) (ok bool, status int, latency int64, errMsg string, err error) {
+	stateEnsure(cfg.StatePath)
+	stateMu.Lock()
+	rec := st.Models[id]
+	stateMu.Unlock()
+	if rec == nil {
+		return false, 0, 0, "", fmt.Errorf("model %q is not tracked", id)
+	}
+	ok, status, latency, errMsg = probeModel(cfg, id)
+
+	stateMu.Lock()
+	rec = st.Models[id] // may have been pruned by a concurrent sync
+	if rec == nil {
+		stateMu.Unlock()
+		return ok, status, latency, errMsg, nil
+	}
+	now := time.Now().Format(time.RFC3339)
+	rec.LastProbeAt = now
+	rec.LastProbeOK = ok
+	rec.LastProbeStatus = status
+	rec.LastProbeLatency = latency
+	rec.LastProbeError = errMsg
+	appendProbeHistory(rec, ProbeEntry{Time: now, OK: ok, Status: status, LatencyMS: latency}, cfg.ProbeHistorySize)
+	if ok {
+		rec.FailCount = 0
+		if rec.QuarantineReason != "" {
+			rec.QuarantineReason = ""
+			auditAddLocked("model_recovered", id, "manual probe OK, restored at next sync")
+		}
+	} else if status == 401 || status == 403 {
+		rec.Restricted = true
+	} else {
+		rec.FailCount++
+		if status == 404 && rec.QuarantineReason == "" {
+			rec.QuarantineReason = "model not found (404)"
+			auditAddLocked("model_quarantined", id, rec.QuarantineReason)
+		} else if rec.FailCount >= cfg.failThreshold() && rec.QuarantineReason == "" {
+			rec.QuarantineReason = fmt.Sprintf("%d consecutive probe failures (last: %s)", rec.FailCount, errMsg)
+			auditAddLocked("model_quarantined", id, rec.QuarantineReason)
+		}
+	}
+	auditAddLocked("model_probed", id, fmt.Sprintf("manual probe: ok=%v status=%d %dms", ok, status, latency))
+	stateSaveLocked()
+	stateMu.Unlock()
+	return ok, status, latency, errMsg, nil
 }

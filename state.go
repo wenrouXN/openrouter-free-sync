@@ -28,6 +28,15 @@ type ModelRecord struct {
 	QuarantineReason string `json:"quarantine_reason,omitempty"`
 	RemovedAt        string `json:"removed_at,omitempty"` // when the model left the desired set
 	Restricted       bool   `json:"restricted"`            // 401/403 agent-harness restriction
+	ProbeHistory     []ProbeEntry `json:"probe_history,omitempty"` // bounded ring of recent probes
+}
+
+// ProbeEntry is one availability probe outcome in a model's history.
+type ProbeEntry struct {
+	Time      string `json:"time"`
+	OK        bool   `json:"ok"`
+	Status    int    `json:"status"`
+	LatencyMS int64  `json:"latency_ms"`
 }
 
 // AuditEvent is one auditable occurrence (model added/removed, sync result, config change).
@@ -136,5 +145,16 @@ func auditAddLocked(eventType, model, detail string) {
 	})
 	if maxA := cfg.AuditMaxEntries; maxA > 0 && len(st.AuditLog) > maxA {
 		st.AuditLog = st.AuditLog[len(st.AuditLog)-maxA:]
+	}
+}
+
+// appendProbeHistory appends one probe outcome, keeping at most max entries.
+func appendProbeHistory(rec *ModelRecord, e ProbeEntry, max int) {
+	if max <= 0 {
+		max = 20
+	}
+	rec.ProbeHistory = append(rec.ProbeHistory, e)
+	if len(rec.ProbeHistory) > max {
+		rec.ProbeHistory = rec.ProbeHistory[len(rec.ProbeHistory)-max:]
 	}
 }

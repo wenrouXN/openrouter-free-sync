@@ -70,7 +70,7 @@ import (
 
 const abiVersion uint32 = 1
 const pluginID = "openrouter-free-sync"
-const pluginVersion = "0.4.0"
+const pluginVersion = "0.5.0"
 
 // --- JSON envelope ---
 
@@ -309,6 +309,10 @@ func handleManagementRegister() ([]byte, error) {
 			{Method: "GET", Path: "/plugins/" + pluginID + "/status"},
 			{Method: "GET", Path: "/plugins/" + pluginID + "/models"},
 			{Method: "GET", Path: "/plugins/" + pluginID + "/audit"},
+			{Method: "GET", Path: "/plugins/" + pluginID + "/preview"},
+			{Method: "POST", Path: "/plugins/" + pluginID + "/preview"},
+			{Method: "POST", Path: "/plugins/" + pluginID + "/probe"},
+			{Method: "GET", Path: "/plugins/" + pluginID + "/alias-map"},
 			// NOTE: GET/PUT /plugins/<id>/config is intercepted natively by the
 			// CPA host (raw config.yaml view). Our masked + overlay-persisting
 			// endpoints live under /settings and are what the panel uses.
@@ -344,6 +348,12 @@ func handleManagementHandle(requestBytes []byte) ([]byte, error) {
 		return okEnvelope(handleGetConfig())
 	case req.Method == "PUT" && req.Path == "/v0/management/plugins/"+pluginID+"/settings":
 		return okEnvelope(handlePutConfig(req))
+	case req.Path == "/v0/management/plugins/"+pluginID+"/preview":
+		return okEnvelope(handlePreview(req))
+	case req.Method == "POST" && req.Path == "/v0/management/plugins/"+pluginID+"/probe":
+		return okEnvelope(handleProbe(req))
+	case req.Method == "GET" && req.Path == "/v0/management/plugins/"+pluginID+"/alias-map":
+		return okEnvelope(handleAliasMap())
 	default:
 		return errorEnvelope("not_found", "no handler for "+req.Method+" "+req.Path), nil
 	}
@@ -406,12 +416,16 @@ func handleModels() managementResponse {
 }
 
 // handleAudit returns the audit log (optionally limited via ?limit=N).
+// ?format=csv exports time,type,model,detail for archiving/sharing.
 func handleAudit(req managementRequest) managementResponse {
 	limit := 0
 	if v, ok := req.Query["limit"]; ok && len(v) > 0 {
 		if n, err := strconv.Atoi(v[0]); err == nil && n > 0 {
 			limit = n
 		}
+	}
+	if v, ok := req.Query["format"]; ok && len(v) > 0 && v[0] == "csv" {
+		return auditCSV(limit)
 	}
 	stateMu.Lock()
 	var log []AuditEvent
@@ -423,6 +437,32 @@ func handleAudit(req managementRequest) managementResponse {
 	}
 	stateMu.Unlock()
 	return mgmtJSON(map[string]interface{}{"count": len(log), "log": log})
+}
+
+// auditCSV renders audit entries as CSV.
+func auditCSV(limit int) managementResponse {
+	stateMu.Lock()
+	var log []AuditEvent
+	if st != nil {
+		log = st.AuditLog
+		if limit > 0 && len(log) > limit {
+			log = log[len(log)-limit:]
+		}
+	}
+	stateMu.Unlock()
+	var b strings.Builder
+	b.WriteString("time,type,model,detail\n")
+	for _, e := range log {
+		b.WriteString(csvEscape(e.Time) + "," + csvEscape(e.Type) + "," + csvEscape(e.Model) + "," + csvEscape(e.Detail) + "\n")
+	}
+	return managementResponse{
+		StatusCode: 200,
+		Headers: map[string][]string{
+			"Content-Type":        {"text/csv; charset=utf-8"},
+			"Content-Disposition": {"attachment; filename=\"orfs-audit.csv\""},
+		},
+		Body: []byte(b.String()),
+	}
 }
 
 func handleGetConfig() managementResponse {
@@ -452,6 +492,13 @@ func handleGetConfig() managementResponse {
 		"audit_max_entries":     c.AuditMaxEntries,
 		"prune_after_days":      c.PruneAfterDays,
 		"state_path":            c.StatePath,
+		"exclude_models":        strings.Join(c.ExcludeModels, ","),
+		"force_include":         strings.Join(c.ForceInclude, ","),
+		"alias_prefix":          c.AliasPrefix,
+		"alias_overrides":       c.AliasOverrides,
+		"require_input_modality": c.RequireInputModality,
+		"require_params":        strings.Join(c.RequireParams, ","),
+		"probe_history_size":    c.ProbeHistorySize,
 	}
 	return mgmtJSON(out)
 }
@@ -747,4 +794,74 @@ func toStringSlice(v []interface{}) []string {
 		}
 	}
 	return result
+}
+
+// --- v0.5.0: preview, manual probe, alias map ---
+
+// handlePreview runs a dry-run filter preview. POST body fields override
+// the current config for the preview only (nothing is persisted or synced).
+func handlePreview(req managementRequest) managementResponse {
+	cfgMu.Lock()
+	c := cfg
+	cfgMu.Unlock()
+
+	var overrides map[string]interface{}
+	if len(req.Body) > 0 {
+		if err := json.Unmarshal(req.Body, &overrides); err != nil {
+			return errorResponse(400, "invalid json: "+err.Error())
+		}
+	}
+
+	res, err := runPreview(c, overrides)
+	if err != nil {
+		return errorResponse(502, "preview failed: "+err.Error())
+	}
+	return mgmtJSON(res)
+}
+
+// handleProbe probes one model immediately (POST body: {"model": "<id>"}),
+// bypassing cooldowns. Quarantine/recovery is recorded; the CPA provider
+// list updates at the next sync (or manual refresh).
+func handleProbe(req managementRequest) managementResponse {
+	cfgMu.Lock()
+	c := cfg
+	cfgMu.Unlock()
+
+	var body struct {
+		Model string `json:"model"`
+	}
+	if len(req.Body) == 0 || json.Unmarshal(req.Body, &body) != nil || body.Model == "" {
+		return errorResponse(400, "body must be {\"model\": \"<id>\"}")
+	}
+
+	ok, status, latency, errMsg, err := probeSingleModel(c, body.Model)
+	if err != nil {
+		return errorResponse(404, err.Error())
+	}
+	return mgmtJSON(map[string]interface{}{
+		"model":       body.Model,
+		"ok":          ok,
+		"status":      status,
+		"latency_ms":  latency,
+		"error":       errMsg,
+	})
+}
+
+// handleAliasMap returns the alias that would be assigned to each filtered
+// model, including overrides and collision fallbacks (preview for aliases).
+func handleAliasMap() managementResponse {
+	cfgMu.Lock()
+	c := cfg
+	cfgMu.Unlock()
+
+	models, err := fetchOpenRouterModels(c)
+	if err != nil {
+		return errorResponse(502, "fetch failed: "+err.Error())
+	}
+	entries := filterModels(models, c)
+	out := make([]map[string]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, map[string]string{"model": e.Name, "alias": e.Alias})
+	}
+	return mgmtJSON(map[string]interface{}{"count": len(out), "aliases": out})
 }

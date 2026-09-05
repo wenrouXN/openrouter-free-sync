@@ -30,3 +30,11 @@ func splitAndTrim(s, sep string) []string {
 	}
 	return result
 }
+
+// csvEscape quotes a value for CSV output when needed.
+func csvEscape(s string) string {
+	if strings.ContainsAny(s, ",\"\n\r") {
+		return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
+	}
+	return s
+}

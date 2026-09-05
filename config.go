@@ -33,6 +33,14 @@ type PluginConfig struct {
 	AuditSyncAlways  bool `yaml:"audit_sync_always"`  // audit every sync even when nothing changed
 	PruneAfterDays   int  `yaml:"prune_after_days"`   // delete inactive model records after N days (0 = never)
 	ProbeCooldownMin int  `yaml:"probe_cooldown_min"` // skip re-probing healthy models within N minutes
+	// v0.5.0: per-model ops, finer filters, alias control
+	ExcludeModels        []string `yaml:"exclude_models"`         // blacklist: never synced (beats filters)
+	ForceInclude         []string `yaml:"force_include"`          // whitelist: always synced (beats filters)
+	AliasPrefix          string   `yaml:"alias_prefix"`           // prefix for auto aliases (e.g. "or-")
+	AliasOverrides       string   `yaml:"alias_overrides"`        // manual aliases: "id=alias,id2=alias2"
+	RequireInputModality string   `yaml:"require_input_modality"` // e.g. "image"; empty = any
+	RequireParams        []string `yaml:"require_params"`         // all must be in supported_parameters
+	ProbeHistorySize     int      `yaml:"probe_history_size"`     // probe history ring size per model
 }
 
 func defaultConfig() PluginConfig {
@@ -54,6 +62,7 @@ func defaultConfig() PluginConfig {
 		AuditSyncAlways:           false,
 		PruneAfterDays:            30,
 		ProbeCooldownMin:          10,
+		ProbeHistorySize:          20,
 	}
 }
 
@@ -125,6 +134,13 @@ func configFields() []map[string]interface{} {
 		{"Name": "audit_sync_always", "Type": "boolean", "Description": "Audit every sync even with no changes (default off: only changes/errors)"},
 		{"Name": "prune_after_days", "Type": "integer", "Description": "Delete inactive model records from state after N days (0 = never)"},
 		{"Name": "probe_cooldown_min", "Type": "integer", "Description": "Skip re-probing healthy models within N minutes of last probe"},
+		{"Name": "exclude_models", "Type": "string", "Description": "Blacklist: comma-separated model IDs never synced (beats filters)"},
+		{"Name": "force_include", "Type": "string", "Description": "Whitelist: comma-separated model IDs always synced (beats filters)"},
+		{"Name": "alias_prefix", "Type": "string", "Description": "Prefix for auto aliases (e.g. or- gives or-model-x)"},
+		{"Name": "alias_overrides", "Type": "string", "Description": "Manual aliases: model-id=alias, comma-separated"},
+		{"Name": "require_input_modality", "Type": "string", "Description": "Require this input modality (e.g. image); empty = any"},
+		{"Name": "require_params", "Type": "string", "Description": "Comma-separated supported_parameters all models must have"},
+		{"Name": "probe_history_size", "Type": "integer", "Description": "Probe history ring size per model (default 20)"},
 	}
 }
 
@@ -237,6 +253,31 @@ func applyConfigFields(c *PluginConfig, incoming map[string]interface{}) []strin
 		c.StatePath = v
 		changed = append(changed, "state_path")
 	}
+	if applyStringListField(incoming, "exclude_models", &c.ExcludeModels) {
+		changed = append(changed, "exclude_models")
+	}
+	if applyStringListField(incoming, "force_include", &c.ForceInclude) {
+		changed = append(changed, "force_include")
+	}
+	if applyStringListField(incoming, "require_params", &c.RequireParams) {
+		changed = append(changed, "require_params")
+	}
+	if v, ok := incoming["alias_prefix"].(string); ok && v != c.AliasPrefix {
+		c.AliasPrefix = v
+		changed = append(changed, "alias_prefix")
+	}
+	if v, ok := incoming["alias_overrides"].(string); ok && v != c.AliasOverrides {
+		c.AliasOverrides = v
+		changed = append(changed, "alias_overrides")
+	}
+	if v, ok := incoming["require_input_modality"].(string); ok && v != c.RequireInputModality {
+		c.RequireInputModality = v
+		changed = append(changed, "require_input_modality")
+	}
+	if v, ok := incoming["probe_history_size"].(float64); ok && int(v) != c.ProbeHistorySize {
+		c.ProbeHistorySize = int(v)
+		changed = append(changed, "probe_history_size")
+	}
 
 	// Secrets: skip empty values and masked echoes; apply genuine new values only.
 	if v, ok := incoming["openrouter_api_key"].(string); ok && v != "" && v != maskSecret(c.OpenRouterAPIKey) && v != c.OpenRouterAPIKey {
@@ -264,4 +305,25 @@ func overlayFromIncoming(existing map[string]interface{}, incoming map[string]in
 		ov[k] = v
 	}
 	return ov
+}
+
+// applyStringListField applies a list field given as comma-string or JSON array.
+// Returns true when the value changed.
+func applyStringListField(incoming map[string]interface{}, key string, dst *[]string) bool {
+	if v, ok := incoming[key].(string); ok {
+		list := splitAndTrim(v, ",")
+		if strings.Join(list, ",") != strings.Join(*dst, ",") {
+			*dst = list
+			return true
+		}
+		return false
+	}
+	if v, ok := incoming[key].([]interface{}); ok {
+		list := toStringSlice(v)
+		if strings.Join(list, ",") != strings.Join(*dst, ",") {
+			*dst = list
+			return true
+		}
+	}
+	return false
 }

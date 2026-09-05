@@ -29,6 +29,23 @@ A [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) plugin that 
   `probe_cooldown_min` (default 10 min); restricted (401/403) models re-probed weekly;
   config changes abort any in-flight sync before it can PATCH stale results
 - **Alias collision safety** — colliding auto-aliases fall back to full model IDs
+- **Filter preview (dry-run)** — `POST /preview` (optionally with field overrides) shows
+  exactly which models would sync / be added / be removed *before* saving anything;
+  the panel has a Preview Filters button that previews unsaved form edits
+- **Per-model ops** — `POST /probe {"model":"<id>"}` probes one model immediately
+  (bypasses cooldowns, records history + audit); `exclude_models` blacklist never
+  syncs a model (beats filters); `force_include` whitelist always syncs it (beats
+  filters, but the ID must still exist in the OpenRouter catalog). Precedence:
+  blacklist > whitelist > filters
+- **Probe history** — each model keeps a bounded ring (default 20,
+  `probe_history_size`) of recent probe outcomes; the panel shows per-model
+  trend dots so flapping models are visible at a glance
+- **Alias refinement** — `alias_prefix` (e.g. `or-` → `or-model-x`) prevents clashes
+  with production models; `alias_overrides` (`model-id=alias,...`) pins manual
+  aliases that beat auto aliases; `GET /alias-map` previews the final mapping
+- **Finer filters** — `require_input_modality` (e.g. `image`) and `require_params`
+  (comma-separated `supported_parameters` that must all be present)
+- **Audit export** — `GET /audit?format=csv&limit=N` exports the log as CSV
 
 ## How It Works
 
@@ -117,6 +134,14 @@ plugins:
       prune_after_days: 30              # delete inactive model records after N days (0 = never)
       probe_cooldown_min: 10            # skip re-probing healthy models within N minutes
       state_path: "/CLIProxyAPI/state/orfs-state.json"  # persist state + audit log + config overlay
+      # v0.5.0
+      exclude_models: []                 # blacklist: never synced (beats filters)
+      force_include: []                  # whitelist: always synced (beats filters)
+      alias_prefix: ""                   # prefix for auto aliases (e.g. "or-")
+      alias_overrides: ""                # "model-id=alias,..." manual aliases
+      require_input_modality: ""         # e.g. "image"; empty = any
+      require_params: []                 # supported_parameters all required
+      probe_history_size: 20             # per-model probe history ring size
 ```
 
 ### Prerequisites
@@ -155,6 +180,10 @@ From here you can:
 | `GET` | `/v0/management/plugins/openrouter-free-sync/status` | Counters + last sync |
 | `GET` | `/v0/management/plugins/openrouter-free-sync/models` | Detailed model metadata + probe status |
 | `GET` | `/v0/management/plugins/openrouter-free-sync/audit?limit=N` | Auditable event log |
+| `GET` | `/v0/management/plugins/openrouter-free-sync/audit?format=csv` | Audit log as CSV download |
+| `POST` | `/v0/management/plugins/openrouter-free-sync/preview` | Dry-run filter preview (body = optional field overrides) |
+| `POST` | `/v0/management/plugins/openrouter-free-sync/probe` | Probe one model now (`{"model":"<id>"}`) |
+| `GET` | `/v0/management/plugins/openrouter-free-sync/alias-map` | Final alias mapping preview |
 | `GET` | `/v0/management/plugins/openrouter-free-sync/settings` | Config (secrets masked) |
 | `PUT` | `/v0/management/plugins/openrouter-free-sync/settings` | Update config (persisted as overlay) |
 
