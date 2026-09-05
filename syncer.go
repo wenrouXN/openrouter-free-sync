@@ -553,6 +553,7 @@ func runSync(cfg PluginConfig) SyncResult {
 
 	// Phase 3: apply probe results + build final list under lock
 	stateMu.Lock()
+	white := toSet(cfg.ForceInclude)
 	for _, id := range probeTargets {
 		rec := st.Models[id]
 		pr, probed := probeResults[id]
@@ -565,6 +566,13 @@ func runSync(cfg PluginConfig) SyncResult {
 		rec.LastProbeLatency = pr.latency
 		rec.LastProbeError = pr.errMsg
 		appendProbeHistory(rec, ProbeEntry{Time: rec.LastProbeAt, OK: pr.ok, Status: pr.status, LatencyMS: pr.latency}, cfg.ProbeHistorySize)
+		if white[id] && rec.QuarantineReason != "" {
+			// self-heal: force_include models are never quarantined
+			rec.QuarantineReason = ""
+			auditAddLocked("model_recovered", id, "whitelist exemption: quarantine cleared")
+			result.Recovered++
+			result.RecoveredIDs = append(result.RecoveredIDs, id)
+		}
 		if pr.status == 401 || pr.status == 403 {
 			// auth / agent-harness restriction, not an availability failure
 			rec.Restricted = true
@@ -590,7 +598,7 @@ func runSync(cfg PluginConfig) SyncResult {
 		}
 		rec.FailCount++
 		if pr.status == 404 {
-			if rec.QuarantineReason == "" {
+			if !white[id] && rec.QuarantineReason == "" {
 				rec.QuarantineReason = "model not found (404)"
 				auditAddLocked("model_quarantined", id, rec.QuarantineReason)
 				result.Quarantined++
@@ -598,18 +606,34 @@ func runSync(cfg PluginConfig) SyncResult {
 			}
 			continue
 		}
-		if rec.FailCount >= cfg.failThreshold() && rec.QuarantineReason == "" {
-			rec.QuarantineReason = fmt.Sprintf("%d consecutive probe failures (last: %s)", rec.FailCount, pr.errMsg)
-			auditAddLocked("model_quarantined", id, rec.QuarantineReason)
-			result.Quarantined++
-			result.QuarantinedIDs = append(result.QuarantinedIDs, id)
+		if rec.FailCount >= cfg.failThreshold() {
+			if white[id] {
+				// user-pinned via force_include: free-tier probes may 429 but
+				// the model must never be dropped from CPA. Audit once at
+				// threshold crossing; status stays visible on the panel.
+				if rec.FailCount == cfg.failThreshold() {
+					auditAddLocked("model_probe_failed_kept", id, fmt.Sprintf("whitelist model failing (last: %s), kept by force_include", pr.errMsg))
+				}
+				continue
+			}
+			if rec.QuarantineReason == "" {
+				rec.QuarantineReason = fmt.Sprintf("%d consecutive probe failures (last: %s)", rec.FailCount, pr.errMsg)
+				auditAddLocked("model_quarantined", id, rec.QuarantineReason)
+				result.Quarantined++
+				result.QuarantinedIDs = append(result.QuarantinedIDs, id)
+			}
 		}
 	}
 	var final []cpaModelEntry
 	for _, m := range filtered {
-		if rec := st.Models[m.Name]; rec != nil && rec.QuarantineReason == "" {
-			final = append(final, m) // m already carries the auto-generated alias
+		rec := st.Models[m.Name]
+		if rec == nil {
+			continue
 		}
+		if rec.QuarantineReason != "" && !white[m.Name] {
+			continue
+		}
+		final = append(final, m) // m already carries the auto-generated alias
 	}
 	result.ModelCount = len(final)
 	stateSaveLocked()
@@ -777,7 +801,13 @@ func probeSingleModel(cfg PluginConfig, id string) (ok bool, status int, latency
 		rec.Restricted = true
 	} else {
 		rec.FailCount++
-		if status == 404 && rec.QuarantineReason == "" {
+		if toSet(cfg.ForceInclude)[id] {
+			// whitelist: never quarantine; clear stale flag if present
+			if rec.QuarantineReason != "" {
+				rec.QuarantineReason = ""
+				auditAddLocked("model_recovered", id, "whitelist exemption: quarantine cleared")
+			}
+		} else if status == 404 && rec.QuarantineReason == "" {
 			rec.QuarantineReason = "model not found (404)"
 			auditAddLocked("model_quarantined", id, rec.QuarantineReason)
 		} else if rec.FailCount >= cfg.failThreshold() && rec.QuarantineReason == "" {
