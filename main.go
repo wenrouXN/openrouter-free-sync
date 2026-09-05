@@ -151,6 +151,10 @@ var (
 // a previous config generation can detect it is stale and abort before PATCH.
 var syncGen atomic.Uint64
 
+// baseCfg is the pure config.yaml-parsed config (pre-overlay), kept so
+// _reset_overlay can restore YAML authority immediately without a restart.
+var baseCfg PluginConfig
+
 var (
 	nextSyncMu sync.Mutex
 	nextSyncAt time.Time
@@ -255,8 +259,12 @@ func handlePluginRegister(method string, requestBytes []byte) ([]byte, error) {
 		newCfg = defaultConfig()
 	}
 
-	// Re-apply panel config overlay so web edits survive restarts.
-	// Secrets are never in the overlay; they always come from config.yaml.
+	// Snapshot pure YAML config for _reset_overlay; then re-apply the panel
+	// config overlay so web edits survive restarts. Secrets are never in the
+	// overlay; they always come from config.yaml.
+	cfgMu.Lock()
+	baseCfg = newCfg
+	cfgMu.Unlock()
 	stateEnsure(newCfg.StatePath)
 	stateMu.Lock()
 	ovCount := 0
@@ -469,6 +477,13 @@ func handlePutConfig(req managementRequest) managementResponse {
 			stateSaveLocked()
 		}
 		stateMu.Unlock()
+		cfgMu.Lock()
+		cfg = baseCfg
+		newCfg := cfg
+		cfgMu.Unlock()
+		stopTicker()
+		startTicker(newCfg)
+		hostLog("info", "openrouter-free-sync: overlay reset, config.yaml authority restored")
 		return mgmtJSON(map[string]string{"status": "overlay reset"})
 	}
 

@@ -17,6 +17,18 @@ A [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) plugin that 
 - **Configurable filters** — all via web UI: min context length, pricing filter (`free` = $0 in + $0 out), excluded providers, require text output, require tools
 - **Web panel** — three tabs: Models (params + probe status), Audit Log (filterable), Config
 - **Hot-reload** — config changes take effect immediately, no CPA restart
+- **Panel edits persist across restarts** — non-secret config changes are saved to a
+  config overlay in the state file and re-applied over config.yaml at startup;
+  `PUT /settings` with `{"_reset_overlay": true}` restores config.yaml authority
+- **Data hygiene** — audit log hard-capped (`audit_max_entries`); unchanged/error-free
+  syncs are not audited unless `audit_sync_always: true`; inactive model records are
+  pruned after `prune_after_days` (default 30); state file carries `schema_version`
+- **Secret safety** — `GET /settings` returns masked secrets; masked echoes on `PUT`
+  never overwrite real keys; secrets never enter the config overlay
+- **Quota protection** — probe cooldown skips re-probing healthy models for
+  `probe_cooldown_min` (default 10 min); restricted (401/403) models re-probed weekly;
+  config changes abort any in-flight sync before it can PATCH stale results
+- **Alias collision safety** — colliding auto-aliases fall back to full model IDs
 
 ## How It Works
 
@@ -100,8 +112,11 @@ plugins:
       availability_check: true          # probe model availability each sync
       availability_fail_threshold: 3    # consecutive failures before quarantine
       probe_interval_ms: 4000           # delay between probes (stay under 20/min free limit)
-      audit_max_entries: 500            # audit log capacity
-      state_path: "/CLIProxyAPI/state/orfs-state.json"  # persist models + audit log
+      audit_max_entries: 500            # audit log capacity (hard cap)
+      audit_sync_always: false          # audit unchanged syncs too (default off)
+      prune_after_days: 30              # delete inactive model records after N days (0 = never)
+      probe_cooldown_min: 10            # skip re-probing healthy models within N minutes
+      state_path: "/CLIProxyAPI/state/orfs-state.json"  # persist state + audit log + config overlay
 ```
 
 ### Prerequisites
@@ -140,8 +155,11 @@ From here you can:
 | `GET` | `/v0/management/plugins/openrouter-free-sync/status` | Counters + last sync |
 | `GET` | `/v0/management/plugins/openrouter-free-sync/models` | Detailed model metadata + probe status |
 | `GET` | `/v0/management/plugins/openrouter-free-sync/audit?limit=N` | Auditable event log |
-| `GET` | `/v0/management/plugins/openrouter-free-sync/config` | Current config |
-| `PUT` | `/v0/management/plugins/openrouter-free-sync/config` | Update config |
+| `GET` | `/v0/management/plugins/openrouter-free-sync/settings` | Config (secrets masked) |
+| `PUT` | `/v0/management/plugins/openrouter-free-sync/settings` | Update config (persisted as overlay) |
+
+> Note: `GET/PUT .../config` is intercepted natively by the CPA host (raw config.yaml
+> view); plugins cannot override host routes, hence `/settings`.
 
 ## Build
 
