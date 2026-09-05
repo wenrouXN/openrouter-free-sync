@@ -51,6 +51,7 @@ type cpaProvider struct {
 	APIKeyEntries []cpaAPIKey       `json:"api-key-entries,omitempty"`
 	Models        []cpaModelEntry   `json:"models"`
 	Headers       map[string]string `json:"headers,omitempty"`
+	Priority      int               `json:"priority,omitempty"` // provider routing priority; must survive GET->PATCH round-trip
 }
 
 type cpaCompatResponse []cpaProvider
