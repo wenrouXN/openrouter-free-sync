@@ -71,6 +71,8 @@ type SyncResult struct {
 	RemovedIDs     []string `json:"removed_ids,omitempty"`
 	QuarantinedIDs []string `json:"quarantined_ids,omitempty"`
 	RecoveredIDs   []string `json:"recovered_ids,omitempty"`
+	Pruned         int      `json:"pruned"`
+	PrunedIDs      []string `json:"pruned_ids,omitempty"`
 }
 
 var (
@@ -138,8 +140,11 @@ func autoAlias(id string) string {
 }
 
 // filterModels applies config filters to the OpenRouter model list.
+// When auto-aliases collide (two vendors exposing the same short name),
+// the colliding models fall back to their full IDs instead of silently
+// overwriting each other in CPA.
 func filterModels(models []orModel, cfg PluginConfig) []cpaModelEntry {
-	var result []cpaModelEntry
+	var passing []orModel
 	for _, m := range models {
 		if m.ContextLength < cfg.MinContextLength {
 			continue
@@ -156,13 +161,60 @@ func filterModels(models []orModel, cfg PluginConfig) []cpaModelEntry {
 		if cfg.RequireToolsSupport && !hasToolsSupport(m.SupportedParams) {
 			continue
 		}
+		passing = append(passing, m)
+	}
+
+	aliasCount := map[string]int{}
+	for _, m := range passing {
+		aliasCount[autoAlias(m.ID)]++
+	}
+
+	var result []cpaModelEntry
+	collisions := 0
+	for _, m := range passing {
 		alias := m.ID
 		if cfg.AutoAlias {
-			alias = autoAlias(m.ID)
+			short := autoAlias(m.ID)
+			if aliasCount[short] > 1 {
+				collisions++
+				// keep full ID: short alias is ambiguous
+			} else {
+				alias = short
+			}
 		}
 		result = append(result, cpaModelEntry{Name: m.ID, Alias: alias})
 	}
+	if collisions > 0 {
+		hostLog("warn", "openrouter-free-sync: "+fmt.Sprint(collisions)+" auto-alias collision(s), falling back to full model IDs")
+	}
 	return result
+}
+
+// pruneInactiveRecords deletes inactive model records older than
+// PruneAfterDays so removed models do not accumulate forever.
+// Legacy records without RemovedAt get stamped (countdown starts now).
+// Caller must hold stateMu.
+func pruneInactiveRecords(cfg PluginConfig, result *SyncResult) {
+	if cfg.PruneAfterDays <= 0 || st == nil {
+		return
+	}
+	now := time.Now()
+	cutoff := now.AddDate(0, 0, -cfg.PruneAfterDays)
+	for id, rec := range st.Models {
+		if rec.Active {
+			continue
+		}
+		if rec.RemovedAt == "" {
+			rec.RemovedAt = now.Format(time.RFC3339)
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, rec.RemovedAt); err == nil && t.Before(cutoff) {
+			auditAddLocked("model_pruned", id, fmt.Sprintf("inactive %d+ days; state record deleted", cfg.PruneAfterDays))
+			delete(st.Models, id)
+			result.Pruned++
+			result.PrunedIDs = append(result.PrunedIDs, id)
+		}
+	}
 }
 
 // fetchOpenRouterModels retrieves the model catalog from OpenRouter.
@@ -290,6 +342,7 @@ func patchCPAProvider(cfg PluginConfig, models []cpaModelEntry) error {
 
 // runSync executes a full sync cycle: fetch → filter → probe → audit → patch.
 func runSync(cfg PluginConfig) SyncResult {
+	g := syncGen.Load()
 	stateEnsure(cfg.StatePath)
 	result := SyncResult{SyncedAt: time.Now().Format(time.RFC3339)}
 	hostLog("info", "openrouter-free-sync: starting sync")
@@ -298,7 +351,7 @@ func runSync(cfg PluginConfig) SyncResult {
 	if err != nil {
 		result.Error = err.Error()
 		hostLog("error", "openrouter-free-sync: fetch failed: "+err.Error())
-		finishSync(result)
+		finishSync(cfg, result)
 		return result
 	}
 
@@ -344,6 +397,7 @@ func runSync(cfg PluginConfig) SyncResult {
 			rec.Tools = hasToolsSupport(om.SupportedParams)
 			if !rec.Active {
 				rec.Active = true
+				rec.RemovedAt = ""
 				auditAddLocked("model_readded", m.Name, "matches filters again")
 				result.Added++
 				result.AddedIDs = append(result.AddedIDs, m.Name)
@@ -357,6 +411,8 @@ func runSync(cfg PluginConfig) SyncResult {
 			rec.Active = false
 			rec.QuarantineReason = ""
 			rec.FailCount = 0
+			rec.Restricted = false
+			rec.RemovedAt = nowT.Format(time.RFC3339)
 			auditAddLocked("model_removed", id, "no longer matches filters or left OpenRouter catalog")
 			result.Removed++
 			result.RemovedIDs = append(result.RemovedIDs, id)
@@ -365,17 +421,29 @@ func runSync(cfg PluginConfig) SyncResult {
 			continue
 		}
 		if rec.QuarantineReason == "" {
+			// Healthy models: honor probe cooldown to save quota.
+			if cfg.ProbeCooldownMin > 0 && rec.LastProbeOK && rec.LastProbeAt != "" {
+				if t, err := time.Parse(time.RFC3339, rec.LastProbeAt); err == nil && nowT.Sub(t) < time.Duration(cfg.ProbeCooldownMin)*time.Minute {
+					continue
+				}
+			}
 			probeTargets = append(probeTargets, id)
 			continue
 		}
-		// Quarantined models are re-probed at most every 30 min to save quota.
+		// Quarantined: re-probe at most every 30 min. Restricted (401/403
+		// agent-harness policy): re-probe weekly — policy changes are rare.
+		backoff := 30 * time.Minute
+		if rec.Restricted {
+			backoff = 7 * 24 * time.Hour
+		}
 		if last := rec.LastProbeAt; last != "" {
-			if t, err := time.Parse(time.RFC3339, last); err == nil && nowT.Sub(t) < 30*time.Minute {
+			if t, err := time.Parse(time.RFC3339, last); err == nil && nowT.Sub(t) < backoff {
 				continue
 			}
 		}
 		probeTargets = append(probeTargets, id)
 	}
+	pruneInactiveRecords(cfg, &result)
 	stateMu.Unlock()
 
 	// Phase 2: probe availability WITHOUT holding the lock
@@ -416,21 +484,23 @@ func runSync(cfg PluginConfig) SyncResult {
 		rec.LastProbeError = pr.errMsg
 		if pr.status == 401 || pr.status == 403 {
 			// auth / agent-harness restriction, not an availability failure
+			rec.Restricted = true
 			if rec.QuarantineReason != "" {
 				rec.QuarantineReason = ""
 				rec.FailCount = 0
 				auditAddLocked("model_recovered", id, "401/403 restriction no longer counted as failure")
 				result.Recovered++
-                result.RecoveredIDs = append(result.RecoveredIDs, id)
+				result.RecoveredIDs = append(result.RecoveredIDs, id)
 			}
 			continue
 		}
+		rec.Restricted = false
 		if pr.ok {
 			if rec.QuarantineReason != "" {
 				rec.QuarantineReason = ""
 				auditAddLocked("model_recovered", id, "probe OK, restored to CPA provider")
 				result.Recovered++
-                result.RecoveredIDs = append(result.RecoveredIDs, id)
+				result.RecoveredIDs = append(result.RecoveredIDs, id)
 			}
 			rec.FailCount = 0
 			continue
@@ -462,23 +532,32 @@ func runSync(cfg PluginConfig) SyncResult {
 	stateSaveLocked()
 	stateMu.Unlock()
 
-	// Phase 4: PATCH CPA
+	// Phase 4: PATCH CPA — abort if config changed mid-run so a stale
+	// filter result never overwrites the provider after a reconfigure.
+	if syncGen.Load() != g {
+		result.Error = "aborted: config changed during sync"
+		hostLog("warn", "openrouter-free-sync: sync aborted before PATCH (config changed mid-run)")
+		finishSync(cfg, result)
+		return result
+	}
 	if err := patchCPAProvider(cfg, final); err != nil {
 		result.Error = err.Error()
 		hostLog("error", "openrouter-free-sync: patch failed: "+err.Error())
-		finishSync(result)
+		finishSync(cfg, result)
 		return result
 	}
 
 	result.Success = true
-	hostLog("info", fmt.Sprintf("openrouter-free-sync: synced %d models (added=%d removed=%d quarantined=%d recovered=%d probed=%d)",
-		len(final), result.Added, result.Removed, result.Quarantined, result.Recovered, result.Probed))
-	finishSync(result)
+	hostLog("info", fmt.Sprintf("openrouter-free-sync: synced %d models (added=%d removed=%d quarantined=%d recovered=%d pruned=%d probed=%d)",
+		len(final), result.Added, result.Removed, result.Quarantined, result.Recovered, result.Pruned, result.Probed))
+	finishSync(cfg, result)
 	return result
 }
 
-// finishSync records the sync outcome in state + audit log.
-func finishSync(result SyncResult) {
+// finishSync records the sync outcome in state + audit log. Unchanged,
+// error-free syncs are NOT audited unless audit_sync_always is set, so
+// routine runs cannot crowd out meaningful events.
+func finishSync(cfg PluginConfig, result SyncResult) {
 	stateMu.Lock()
 	if st != nil {
 		st.LastSync = LastSyncMeta{
@@ -487,8 +566,11 @@ func finishSync(result SyncResult) {
 			Error:       result.Error,
 			ActiveCount: result.ModelCount,
 		}
-		detail := fmt.Sprintf("active=%d added=%d removed=%d quarantined=%d recovered=%d probed=%d",
-			result.ModelCount, result.Added, result.Removed, result.Quarantined, result.Recovered, result.Probed)
+		significant := result.Added > 0 || result.Removed > 0 || result.Quarantined > 0 ||
+			result.Recovered > 0 || result.Pruned > 0 || result.Error != ""
+		if cfg.AuditSyncAlways || significant {
+			detail := fmt.Sprintf("active=%d added=%d removed=%d quarantined=%d recovered=%d pruned=%d probed=%d",
+				result.ModelCount, result.Added, result.Removed, result.Quarantined, result.Recovered, result.Pruned, result.Probed)
 		var parts []string
 		if len(result.AddedIDs) > 0 {
 			parts = append(parts, "added: "+strings.Join(result.AddedIDs, ", "))
@@ -503,12 +585,13 @@ func finishSync(result SyncResult) {
 			parts = append(parts, "recovered: "+strings.Join(result.RecoveredIDs, ", "))
 		}
 		if len(parts) > 0 {
-			detail += " | " + strings.Join(parts, " ; ")
+				detail += " | " + strings.Join(parts, " ; ")
+			}
+			if result.Error != "" {
+				detail += " error=" + result.Error
+			}
+			auditAddLocked("sync", fmt.Sprintf("%d active", result.ModelCount), detail)
 		}
-		if result.Error != "" {
-			detail += " error=" + result.Error
-		}
-		auditAddLocked("sync", fmt.Sprintf("%d active", result.ModelCount), detail)
 		stateSaveLocked()
 	}
 	stateMu.Unlock()

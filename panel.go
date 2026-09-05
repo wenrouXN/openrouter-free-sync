@@ -55,7 +55,7 @@ tr.dead td{opacity:0.45}
 </head>
 <body>
 <h1>🔄 OpenRouter Free Sync</h1>
-<p class="sub">Auto-sync free OpenRouter models into CPA openai-compatibility provider · v0.2.0</p>
+<p class="sub">Auto-sync free OpenRouter models into CPA openai-compatibility provider · v0.4.0</p>
 
 <div class="card">
   <h2>Management Key</h2>
@@ -168,13 +168,14 @@ async function loadStatus() {
     let badge = ls.success===true ? '<span class="badge ok">OK</span>'
               : ls.error ? '<span class="badge fail">Error</span>' : '<span class="badge muted">Never synced</span>';
     let when = ls.time ? tFmt(ls.time) : "-";
+    let nextLine = d.next_sync_at ? '<br><span class="log-count">next sync: ' + tFmt(d.next_sync_at) + '</span>' : '';
     document.getElementById("stats").innerHTML =
       badge + ' <span class="log-count">last: '+when+(ls.error? ' · '+esc(ls.error):'')+'</span>'
       + '<br><br>'
       + '<span class="stat"><b>'+d.models_active+'</b> <span>active</span></span>'
       + '<span class="stat"><b>'+(d.models_quarantined||0)+'</b> <span>quarantined</span></span>'
       + '<span class="stat"><b>'+(d.models_total||0)+'</b> <span>tracked total</span></span>'
-      + '<span class="stat"><b>'+(d.audit_count||0)+'</b> <span>audit events</span></span>';
+      + '<span class="stat"><b>'+(d.audit_count||0)+'</b> <span>audit events</span></span>' + nextLine;
   } catch(e) {
     document.getElementById("stats").innerHTML = '<span class="badge fail">Error</span> ' + esc(e.message);
   }
@@ -239,11 +240,14 @@ const CFG_FIELDS = [
   ["excluded_providers","text"],["require_text_output","checkbox"],["require_tools_support","checkbox"],
   ["openrouter_api_key","password"],["openrouter_base_url","text"],["provider_name","text"],
   ["management_key","password"],["cpa_base_url","text"],
-  ["availability_check","checkbox"],["availability_fail_threshold","number"],["audit_max_entries","number"],["state_path","text"]
+  ["availability_check","checkbox"],["availability_fail_threshold","number"],
+  ["probe_interval_ms","number"],["probe_cooldown_min","number"],
+  ["audit_sync_always","checkbox"],["audit_max_entries","number"],["prune_after_days","number"],
+  ["state_path","text"]
 ];
 async function loadConfig() {
   try {
-    let d = await api("GET", "/config");
+    let d = await api("GET", "/settings");
     document.getElementById("configForm").innerHTML = CFG_FIELDS.map(([k,t]) => {
       let v = d[k];
       if (t==="checkbox") return '<div class="row"><label>'+k+'</label><input type="checkbox" id="cfg_'+k+'" '+(v?'checked':'')+'></div>';
@@ -264,7 +268,7 @@ async function saveConfig() {
   });
   body["excluded_providers"] = body["excluded_providers"].split(",").map(s=>s.trim()).filter(Boolean);
   try {
-    await api("PUT", "/config", body);
+    await api("PUT", "/settings", body);
     alert("Config saved.");
     loadStatus(); loadAudit();
   } catch(e) { alert("Save failed: " + e.message); }

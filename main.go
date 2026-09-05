@@ -61,14 +61,16 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
 
 const abiVersion uint32 = 1
 const pluginID = "openrouter-free-sync"
-const pluginVersion = "0.3.0"
+const pluginVersion = "0.4.0"
 
 // --- JSON envelope ---
 
@@ -144,6 +146,30 @@ var (
 	tickerDone chan struct{}
 	cfgLoaded bool
 )
+
+// syncGen increments on every scheduler restart so an in-flight sync from
+// a previous config generation can detect it is stale and abort before PATCH.
+var syncGen atomic.Uint64
+
+var (
+	nextSyncMu sync.Mutex
+	nextSyncAt time.Time
+)
+
+func setNextSyncAt(t time.Time) {
+	nextSyncMu.Lock()
+	nextSyncAt = t
+	nextSyncMu.Unlock()
+}
+
+func nextSyncString() string {
+	nextSyncMu.Lock()
+	defer nextSyncMu.Unlock()
+	if nextSyncAt.IsZero() {
+		return ""
+	}
+	return nextSyncAt.Format(time.RFC3339)
+}
 
 func main() {}
 
@@ -229,6 +255,19 @@ func handlePluginRegister(method string, requestBytes []byte) ([]byte, error) {
 		newCfg = defaultConfig()
 	}
 
+	// Re-apply panel config overlay so web edits survive restarts.
+	// Secrets are never in the overlay; they always come from config.yaml.
+	stateEnsure(newCfg.StatePath)
+	stateMu.Lock()
+	ovCount := 0
+	if st != nil && len(st.ConfigOverlay) > 0 {
+		ovCount = len(applyConfigFields(&newCfg, st.ConfigOverlay))
+	}
+	stateMu.Unlock()
+	if ovCount > 0 {
+		hostLog("info", fmt.Sprintf("openrouter-free-sync: config overlay re-applied (%d fields)", ovCount))
+	}
+
 	cfgMu.Lock()
 	cfg = newCfg
 	cfgLoaded = true
@@ -262,8 +301,11 @@ func handleManagementRegister() ([]byte, error) {
 			{Method: "GET", Path: "/plugins/" + pluginID + "/status"},
 			{Method: "GET", Path: "/plugins/" + pluginID + "/models"},
 			{Method: "GET", Path: "/plugins/" + pluginID + "/audit"},
-			{Method: "GET", Path: "/plugins/" + pluginID + "/config"},
-			{Method: "PUT", Path: "/plugins/" + pluginID + "/config"},
+			// NOTE: GET/PUT /plugins/<id>/config is intercepted natively by the
+			// CPA host (raw config.yaml view). Our masked + overlay-persisting
+			// endpoints live under /settings and are what the panel uses.
+			{Method: "GET", Path: "/plugins/" + pluginID + "/settings"},
+			{Method: "PUT", Path: "/plugins/" + pluginID + "/settings"},
 		},
 		Resources: []resourceRoute{
 			{Path: "/panel", Menu: "OpenRouter Free Sync", Description: "Configure and sync free OpenRouter models into CPA."},
@@ -290,9 +332,9 @@ func handleManagementHandle(requestBytes []byte) ([]byte, error) {
 		return okEnvelope(handleModels())
 	case req.Method == "GET" && req.Path == "/v0/management/plugins/"+pluginID+"/audit":
 		return okEnvelope(handleAudit(req))
-	case req.Method == "GET" && req.Path == "/v0/management/plugins/"+pluginID+"/config":
+	case req.Method == "GET" && req.Path == "/v0/management/plugins/"+pluginID+"/settings":
 		return okEnvelope(handleGetConfig())
-	case req.Method == "PUT" && req.Path == "/v0/management/plugins/"+pluginID+"/config":
+	case req.Method == "PUT" && req.Path == "/v0/management/plugins/"+pluginID+"/settings":
 		return okEnvelope(handlePutConfig(req))
 	default:
 		return errorEnvelope("not_found", "no handler for "+req.Method+" "+req.Path), nil
@@ -338,6 +380,7 @@ func handleStatus() managementResponse {
 		"models_quarantined": quarantined,
 		"models_total":    total,
 		"audit_count":     auditCount,
+		"next_sync_at":    nextSyncString(),
 	})
 }
 
@@ -387,16 +430,19 @@ func handleGetConfig() managementResponse {
 		"excluded_providers":    joinProviders(c.ExcludedProviders),
 		"require_text_output":   c.RequireTextOutput,
 		"require_tools_support": c.RequireToolsSupport,
-		"openrouter_api_key":    c.OpenRouterAPIKey,
+		"openrouter_api_key":    maskSecret(c.OpenRouterAPIKey),
 		"openrouter_base_url":   c.OpenRouterBaseURL,
 		"provider_name":         c.ProviderName,
-		"management_key":        c.ManagementKey,
+		"management_key":        maskSecret(c.ManagementKey),
 		"cpa_base_url":          c.CPABaseURL,
 		"auto_alias":            c.AutoAlias,
 		"availability_check":    c.AvailabilityCheck,
 		"availability_fail_threshold": c.AvailabilityFailThreshold,
 		"probe_interval_ms":     c.ProbeIntervalMS,
+		"probe_cooldown_min":    c.ProbeCooldownMin,
+		"audit_sync_always":     c.AuditSyncAlways,
 		"audit_max_entries":     c.AuditMaxEntries,
+		"prune_after_days":      c.PruneAfterDays,
 		"state_path":            c.StatePath,
 	}
 	return mgmtJSON(out)
@@ -413,71 +459,33 @@ func handlePutConfig(req managementRequest) managementResponse {
 		return errorResponse(400, "invalid json: "+err.Error())
 	}
 
+	stateEnsure(cfg.StatePath)
+
+	if v, ok := incoming["_reset_overlay"].(bool); ok && v {
+		stateMu.Lock()
+		if st != nil {
+			st.ConfigOverlay = nil
+			auditAddLocked("config_updated", "", "overlay reset: config.yaml is authoritative again")
+			stateSaveLocked()
+		}
+		stateMu.Unlock()
+		return mgmtJSON(map[string]string{"status": "overlay reset"})
+	}
+
 	cfgMu.Lock()
-	newCfg := cfg // start from current
-
-	if v, ok := incoming["refresh_interval"].(string); ok {
-		newCfg.RefreshInterval = v
-	}
-	if v, ok := incoming["min_context_length"].(float64); ok {
-		newCfg.MinContextLength = int(v)
-	}
-	if v, ok := incoming["pricing_filter"].(string); ok {
-		newCfg.PricingFilter = v
-	}
-	if v, ok := incoming["excluded_providers"].(string); ok {
-		newCfg.ExcludedProviders = splitProviders(v)
-	} else if v, ok := incoming["excluded_providers"].([]interface{}); ok {
-		newCfg.ExcludedProviders = toStringSlice(v)
-	}
-	if v, ok := incoming["require_text_output"].(bool); ok {
-		newCfg.RequireTextOutput = v
-	}
-	if v, ok := incoming["require_tools_support"].(bool); ok {
-		newCfg.RequireToolsSupport = v
-	}
-	if v, ok := incoming["openrouter_api_key"].(string); ok {
-		newCfg.OpenRouterAPIKey = v
-	}
-	if v, ok := incoming["openrouter_base_url"].(string); ok {
-		newCfg.OpenRouterBaseURL = v
-	}
-	if v, ok := incoming["provider_name"].(string); ok {
-		newCfg.ProviderName = v
-	}
-	if v, ok := incoming["management_key"].(string); ok {
-		newCfg.ManagementKey = v
-	}
-	if v, ok := incoming["cpa_base_url"].(string); ok {
-		newCfg.CPABaseURL = v
-	}
-	if v, ok := incoming["auto_alias"].(bool); ok {
-		newCfg.AutoAlias = v
-	}
-	if v, ok := incoming["availability_check"].(bool); ok {
-		newCfg.AvailabilityCheck = v
-	}
-	if v, ok := incoming["availability_fail_threshold"].(float64); ok {
-		newCfg.AvailabilityFailThreshold = int(v)
-	}
-	if v, ok := incoming["probe_interval_ms"].(float64); ok {
-		newCfg.ProbeIntervalMS = int(v)
-	}
-	if v, ok := incoming["audit_max_entries"].(float64); ok {
-		newCfg.AuditMaxEntries = int(v)
-	}
-	if v, ok := incoming["state_path"].(string); ok {
-		newCfg.StatePath = v
-	}
-
-	cfg = newCfg
+	changed := applyConfigFields(&cfg, incoming)
+	newCfg := cfg
 	cfgMu.Unlock()
 
-	// Reload state if the path changed + audit the change
-	stateEnsure(newCfg.StatePath)
+	// Persist overlay (secrets/state_path excluded) so panel edits survive restarts.
 	stateMu.Lock()
-	auditAddLocked("config_updated", "", summarizeConfigChange(incoming))
-	stateSaveLocked()
+	if st != nil {
+		st.ConfigOverlay = overlayFromIncoming(st.ConfigOverlay, incoming)
+		if len(changed) > 0 {
+			auditAddLocked("config_updated", "", "changed: "+strings.Join(changed, ", "))
+		}
+		stateSaveLocked()
+	}
 	stateMu.Unlock()
 
 	// Restart ticker
@@ -509,6 +517,7 @@ func startTicker(c PluginConfig) {
 			hostLog("info", fmt.Sprintf("openrouter-free-sync: scheduler started, cron=%q (container TZ)", expr))
 			for {
 				next := sched.Next(time.Now())
+				setNextSyncAt(next)
 				timer := time.NewTimer(time.Until(next))
 				select {
 				case <-tickerDone:
@@ -528,6 +537,7 @@ func startTicker(c PluginConfig) {
 		d := c.RefreshDuration()
 		hostLog("info", fmt.Sprintf("openrouter-free-sync: scheduler started, interval=%s", formatDuration(d)))
 		ticker = time.NewTicker(d)
+		setNextSyncAt(time.Now().Add(d))
 		for {
 			select {
 			case <-tickerDone:
@@ -538,12 +548,15 @@ func startTicker(c PluginConfig) {
 				cfgMu.Unlock()
 				result := runSyncSerialized(currentCfg)
 				setLastSync(result)
+				setNextSyncAt(time.Now().Add(d))
 			}
 		}
 	}()
 }
 
 func stopTicker() {
+	syncGen.Add(1) // abort any in-flight sync from the previous generation
+	setNextSyncAt(time.Time{})
 	if debounceTimer != nil {
 		debounceTimer.Stop()
 		debounceTimer = nil

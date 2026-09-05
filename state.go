@@ -26,6 +26,8 @@ type ModelRecord struct {
 	LastProbeLatency int64  `json:"last_probe_latency_ms,omitempty"`
 	LastProbeError   string `json:"last_probe_error,omitempty"`
 	QuarantineReason string `json:"quarantine_reason,omitempty"`
+	RemovedAt        string `json:"removed_at,omitempty"` // when the model left the desired set
+	Restricted       bool   `json:"restricted"`            // 401/403 agent-harness restriction
 }
 
 // AuditEvent is one auditable occurrence (model added/removed, sync result, config change).
@@ -46,10 +48,17 @@ type LastSyncMeta struct {
 
 // SyncState is the persisted plugin state.
 type SyncState struct {
-	Models   map[string]*ModelRecord `json:"models"`
-	AuditLog []AuditEvent            `json:"audit_log"`
-	LastSync LastSyncMeta            `json:"last_sync"`
+	SchemaVersion int                     `json:"schema_version"`
+	Models        map[string]*ModelRecord `json:"models"`
+	AuditLog      []AuditEvent            `json:"audit_log"`
+	LastSync      LastSyncMeta            `json:"last_sync"`
+	// ConfigOverlay holds panel-applied config changes (secrets excluded),
+	// re-applied on top of config.yaml at plugin start so web edits
+	// survive CPA restarts.
+	ConfigOverlay map[string]interface{} `json:"config_overlay,omitempty"`
 }
+
+const stateSchemaVersion = 1
 
 var (
 	stateMu   sync.Mutex
@@ -65,7 +74,7 @@ func stateEnsure(path string) {
 		return
 	}
 	statePath = path
-	fresh := &SyncState{Models: map[string]*ModelRecord{}, AuditLog: []AuditEvent{}}
+	fresh := &SyncState{SchemaVersion: stateSchemaVersion, Models: map[string]*ModelRecord{}, AuditLog: []AuditEvent{}}
 	if path == "" {
 		st = fresh
 		return
@@ -86,6 +95,9 @@ func stateEnsure(path string) {
 	}
 	if loaded.AuditLog == nil {
 		loaded.AuditLog = []AuditEvent{}
+	}
+	if loaded.SchemaVersion == 0 {
+		loaded.SchemaVersion = stateSchemaVersion // forward migration: stamp legacy files
 	}
 	st = &loaded
 }
